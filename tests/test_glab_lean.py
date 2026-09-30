@@ -214,6 +214,65 @@ class Api(unittest.TestCase):
         self.assertEqual(out.getvalue(), "1\t9\n")
 
 
+class Security(unittest.TestCase):
+    def run_cli(self, *argv):
+        return subprocess.run([sys.executable, PATH, *argv], capture_output=True, text=True)
+
+    def test_refuses_absolute_urls_and_odd_paths(self):
+        for bad in ("http://evil.example/x", "https://evil.example/x", "//evil.example/x",
+                    "/projects/1", "-XPOST", "graphql", "projects/1/../../x", "projects/1#frag"):
+            with self.assertRaises(gl.ApiError, msg=bad):
+                gl.check_path(bad)
+        for good in ("projects/:id/jobs?scope[]=failed", "projects/group%2Fproj/pipelines/1",
+                     "merge_requests?scope=created_by_me", "version"):
+            gl.check_path(good)
+
+    def test_api_url_never_reaches_glab(self):
+        with mock.patch.object(gl.subprocess, "run") as run:
+            with self.assertRaises(gl.ApiError):
+                gl.glab("https://evil.example/steal")
+        run.assert_not_called()
+
+    def test_repo_must_be_a_path(self):
+        p = self.run_cli("-R", "https://evil.example/g/p", "pipes")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("not a URL", p.stderr)
+
+    def test_ids_are_validated(self):
+        self.assertNotEqual(self.run_cli("job", "1/../../x").returncode, 0)
+        self.assertNotEqual(self.run_cli("resolve", "1", "x/../../issues").returncode, 0)
+        self.assertNotEqual(self.run_cli("mr", "abc").returncode, 0)
+        self.assertEqual(gl.mr_iid("!42"), "42")
+
+    def test_sanitize_strips_terminal_controls(self):
+        evil = ("a\x1b]52;c;ZXZpbA==\x1b\\b\x1b]8;;http://x\x07c\x1bP1$qm\x1b\\d"
+                "\x1b[>0ce\x9b31mf\x1bcg\u202eh\u200bi\rj\x07k")
+        self.assertEqual(gl.sanitize(evil), "abcdefghijk")
+        self.assertEqual(gl.sanitize("tab\tand\nnewline"), "tab\tand\nnewline")
+
+    def test_stdout_is_sanitized(self):
+        buf = io.StringIO()
+        gl.SafeOut(buf).write("title\x1b]52;c;x\x07!")
+        self.assertEqual(buf.getvalue(), "title!")
+
+    def test_paginate_stops_on_objects_and_caps_pages(self):
+        run, calls = fake_run([{"id": 1, **{f"k{i}": i for i in range(30)}}])
+        with mock.patch.object(gl.subprocess, "run", run):
+            self.assertEqual(gl.glab("projects/:id/merge_requests/1", paginate=True)["id"], 1)
+        self.assertEqual(len(calls), 1)
+
+        def endless(cmd, input=None, capture_output=None):
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps([{"id": 1}] * 100).encode(), stderr=b"")
+        with mock.patch.object(gl.subprocess, "run", endless), redirect_stdout(io.StringIO()):
+            rows = gl.glab("projects/:id/jobs?per_page=100", paginate=True)
+        self.assertEqual(len(rows), 100 * gl.MAX_PAGES)
+
+    def test_per_page_over_cap_still_paginates(self):
+        run, calls = fake_run([[{"id": i} for i in range(100)], [{"id": 100}]])
+        with mock.patch.object(gl.subprocess, "run", run):
+            self.assertEqual(len(gl.glab("projects/:id/jobs?per_page=500", paginate=True)), 101)
+
+
 class Cli(unittest.TestCase):
     def test_repo_flag_after_subcommand(self):
         with mock.patch.object(sys, "argv", ["glab-lean", "pipes", "-R", "g/p", "--limit", "1"]), \

@@ -18,6 +18,11 @@ CACHE = os.path.expanduser(os.environ.get("GLAB_LEAN_CACHE", "~/.cache/glab-lean
 DONE_JOB = {"success", "failed", "canceled", "skipped", "manual"}
 DONE_PIPE = {"success", "failed", "canceled", "skipped", "manual", "blocked"}
 REPO = None
+MAX_PAGES = 50
+# Only relative REST paths on the host glab resolves. Absolute URLs would make glab send the
+# token to another host, so they're refused before glab sees them.
+SAFE_PATH = re.compile(r"^(projects|merge_requests|groups|users?|version|issues|todos|runners|namespaces)(/|\?|$)")
+REPO_RX = re.compile(r"^[\w.-]+(/[\w.-]+)+$")
 
 
 # ---------------------------------------------------------------- API helpers
@@ -26,21 +31,31 @@ class ApiError(Exception):
     pass
 
 
+def check_path(path):
+    if "://" in path or "#" in path or not SAFE_PATH.match(path) or \
+            re.search(r"(^|/)\.\.(/|$)", path.split("?")[0]):
+        raise ApiError(f"refusing path {path!r}: pass a relative REST path such as projects/:id/pipelines")
+
+
 def glab(path, method="GET", body=None, raw=False, paginate=False):
+    check_path(path)
     cmd = ["glab", "api"]
     if REPO:
         cmd += ["-R", REPO]
     if method != "GET":
         cmd += ["-X", method]
     if paginate:  # page by hand: `--output ndjson` needs a recent glab
-        rows, page = [], 1
+        rows, size = [], min(per_page(path), 100)  # GitLab caps per_page at 100
         sep = "&" if "?" in path else "?"
-        while True:
+        for page in range(1, MAX_PAGES + 1):
             chunk = glab(f"{path}{sep}page={page}", method, body, raw)
-            rows.extend(chunk or [])
-            if not chunk or len(chunk) < per_page(path):
+            if not isinstance(chunk, list):  # single-object endpoint: no pages
+                return chunk if page == 1 else rows
+            rows.extend(chunk)
+            if len(chunk) < size:
                 return rows
-            page += 1
+        print(f"glab-lean: stopped after {MAX_PAGES} pages", file=sys.stderr)
+        return rows
     inp = None
     if body is not None:
         cmd += ["-H", "Content-Type: application/json", "--input", "-"]
@@ -137,7 +152,30 @@ def resolve_pipe(pid=None, mr=None, ref=None):
 
 TS = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z [0-9a-f]{2}[OE](\+| )?")
 SECTION = re.compile(r"section_(start|end):\d+:([^\r\s\[]+)(\[[^\]]*\])?\r?(\x1b\[0K)?")
-ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+# Every escape form a terminal acts on: CSI, OSC (BEL or ST ended), DCS/SOS/PM/APC, 2-byte ESC,
+# and 8-bit CSI. Then any remaining C0/C1 control and invisible bidi/zero-width characters.
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|"
+                  r"\x1b[PX^_][^\x1b]*(?:\x1b\\)?|\x1b[ -/]*[0-~]|\x9b[0-?]*[ -/]*[@-~]")
+CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def sanitize(text):
+    """Strip terminal control sequences from untrusted GitLab text before it's printed."""
+    return CTRL.sub("", ANSI.sub("", text))
+
+
+class SafeOut:
+    """stdout wrapper: everything printed passes through sanitize()."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        return self.stream.write(sanitize(text))
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
 
 
 def clean_log(raw):
@@ -174,17 +212,24 @@ def job_log(job):
     """Return (lines, cache_path). Finished jobs are read from and written to cache."""
     m = re.match(r"https?://([^/]+)/(.+?)/-/jobs/", job["web_url"])
     slug = (m.group(1) + "/" + m.group(2)).replace("/", "_") if m else "unknown"
-    path = os.path.join(CACHE, slug, f"{job['id']}.log")
+    path = os.path.join(CACHE, slug, f"{int(job['id'])}.log")
     done = job["status"] in DONE_JOB - {"manual"}
     if done and os.path.exists(path):
         with open(path, encoding="utf-8", errors="replace") as f:
             return f.read().split("\n"), path
     lines = clean_log(glab(f"projects/:id/jobs/{job['id']}/trace", raw=True))
     # Logs can hold secrets a job printed: keep the cache private to the user.
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    for d in (CACHE, folder):
+        st = os.stat(d)
+        if st.st_uid == os.getuid() and not st.st_mode & 0o1000:  # never chmod a shared dir like /tmp
+            os.chmod(d, 0o700)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    os.replace(tmp, path)
     return lines, path
 
 
@@ -713,6 +758,18 @@ def cmd_api(a):
 
 # ---------------------------------------------------------------- CLI
 
+def disc_id(s):
+    if not re.fullmatch(r"[0-9a-f]{8,64}", s):
+        raise argparse.ArgumentTypeError("discussion IDs are hex, as printed by `threads`")
+    return s
+
+
+def mr_iid(s):
+    if not re.fullmatch(r"!?\d+", s):
+        raise argparse.ArgumentTypeError("MR IIDs are numbers, like 42 or !42")
+    return s.lstrip("!")
+
+
 def main():
     global REPO
     ap = argparse.ArgumentParser(prog="glab-lean", description="Token-lean GitLab views. IDs default to the current branch.")
@@ -724,19 +781,19 @@ def main():
     sp.add_parser = lambda *x, **k: _add(*x, parents=[common], **k)
 
     p = sp.add_parser("mr", help="MR summary: merge readiness, pipeline, threads, files")
-    p.add_argument("iid", nargs="?")
+    p.add_argument("iid", nargs="?", type=mr_iid)
     p.add_argument("--desc", type=int, default=8, help="description lines (0 none, -1 all)")
     p.add_argument("--files", type=int, default=15)
     p.set_defaults(fn=cmd_mr)
 
     p = sp.add_parser("diff", help="MR diffstat, or diffs of files matching PATHS")
-    p.add_argument("iid", nargs="?")
+    p.add_argument("iid", nargs="?", type=mr_iid)
     p.add_argument("paths", nargs="*")
     p.add_argument("--max", type=int, default=300, help="max lines per file")
     p.set_defaults(fn=cmd_diff)
 
     p = sp.add_parser("threads", help="unresolved MR threads, one block each")
-    p.add_argument("iid", nargs="?")
+    p.add_argument("iid", nargs="?", type=mr_iid)
     p.add_argument("--all", action="store_true", help="include resolved and general comments")
     p.add_argument("--general", action="store_true", help="only non-resolvable comments (use with --all)")
     p.add_argument("--full", action="store_true", help="untruncated bodies and every reply")
@@ -753,8 +810,8 @@ def main():
     p.set_defaults(fn=cmd_mrs)
 
     p = sp.add_parser("pipe", help="pipeline summary: counts plus non-green jobs")
-    p.add_argument("id", nargs="?")
-    p.add_argument("--mr", nargs="?", const="", help="use the MR's head pipeline")
+    p.add_argument("id", nargs="?", type=int)
+    p.add_argument("--mr", nargs="?", const="", type=mr_iid, help="use the MR's head pipeline")
     p.add_argument("--ref")
     p.add_argument("--all", action="store_true", help="list every job")
     p.set_defaults(fn=cmd_pipe)
@@ -766,7 +823,7 @@ def main():
     p.set_defaults(fn=cmd_pipes)
 
     p = sp.add_parser("job", help="job status and log extract; full log cached on disk")
-    p.add_argument("id")
+    p.add_argument("id", type=int)
     p.add_argument("--grep", metavar="RE")
     p.add_argument("-C", "--context", type=int, default=0)
     p.add_argument("--tail", type=int)
@@ -779,16 +836,16 @@ def main():
 
     p = sp.add_parser("wait", help="block silently until a job/pipeline/MR settles, then summarize")
     p.add_argument("kind", choices=["job", "pipe", "mr"])
-    p.add_argument("id", nargs="?")
+    p.add_argument("id", nargs="?", type=mr_iid, help="job, pipeline, or MR ID (MR defaults to the branch's)")
     p.add_argument("--until", help="comma-separated states to stop on (MR: merged, mergeable, …)")
     p.add_argument("--every", type=int, default=20, help="poll interval seconds")
     p.add_argument("--timeout", type=int, default=3600)
     p.set_defaults(fn=cmd_wait)
 
     p = sp.add_parser("tf", help="Terraform/OpenTofu plan summary from job logs")
-    p.add_argument("job", nargs="?")
-    p.add_argument("--pipe")
-    p.add_argument("--mr", nargs="?", const="")
+    p.add_argument("job", nargs="?", type=int)
+    p.add_argument("--pipe", type=int)
+    p.add_argument("--mr", nargs="?", const="", type=mr_iid)
     p.add_argument("--name", default="plan", help="job-name regex when using --pipe/--mr")
     p.add_argument("-r", "--resource", help="show the change block for resources containing this")
     p.add_argument("--full", action="store_true", help="with -r: include unchanged lines")
@@ -801,42 +858,42 @@ def main():
     p.set_defaults(fn=cmd_run)
 
     p = sp.add_parser("play", help="start a manual job")
-    p.add_argument("id")
+    p.add_argument("id", type=int)
     p.add_argument("-v", "--var", action="append", metavar="K=V")
     p.set_defaults(fn=cmd_play)
 
     p = sp.add_parser("retry", help="retry a job, or a pipeline's failed jobs with --pipe")
-    p.add_argument("id")
+    p.add_argument("id", type=int)
     p.add_argument("--pipe", action="store_true")
     p.set_defaults(fn=cmd_retry)
 
     p = sp.add_parser("cancel", help="cancel a job, or a pipeline with --pipe")
-    p.add_argument("id")
+    p.add_argument("id", type=int)
     p.add_argument("--pipe", action="store_true")
     p.set_defaults(fn=cmd_cancel)
 
     p = sp.add_parser("merge", help="merge an MR (or set auto-merge)")
-    p.add_argument("iid", nargs="?")
+    p.add_argument("iid", nargs="?", type=mr_iid)
     p.add_argument("--squash", action="store_true")
     p.add_argument("--rm-branch", action="store_true")
     p.add_argument("--auto", action="store_true", help="merge when the pipeline succeeds")
     p.set_defaults(fn=cmd_merge)
 
     p = sp.add_parser("note", help="comment on an MR (body '-' reads stdin)")
-    p.add_argument("iid")
+    p.add_argument("iid", type=mr_iid)
     p.add_argument("body")
     p.set_defaults(fn=cmd_note)
 
     p = sp.add_parser("reply", help="reply to an MR thread")
-    p.add_argument("iid")
-    p.add_argument("disc")
+    p.add_argument("iid", type=mr_iid)
+    p.add_argument("disc", type=disc_id)
     p.add_argument("body")
     p.add_argument("--resolve", action="store_true")
     p.set_defaults(fn=cmd_reply)
 
     p = sp.add_parser("resolve", help="resolve an MR thread")
-    p.add_argument("iid")
-    p.add_argument("disc")
+    p.add_argument("iid", type=mr_iid)
+    p.add_argument("disc", type=disc_id)
     p.add_argument("--undo", action="store_true")
     p.set_defaults(fn=cmd_resolve)
 
@@ -850,10 +907,15 @@ def main():
 
     a = ap.parse_args()
     REPO = a.repo
+    if REPO and not REPO_RX.match(REPO):
+        sys.exit("glab-lean: -R takes group/project, not a URL")
+    if a.cmd == "wait" and a.kind != "mr" and a.id is None:
+        sys.exit(f"glab-lean: wait {a.kind} needs an ID")
+    sys.stdout = SafeOut(sys.stdout)
     try:
         a.fn(a)
     except ApiError as e:
-        sys.exit(f"glab-lean: {e}")
+        sys.exit(sanitize(f"glab-lean: {e}"))
     except BrokenPipeError:
         pass
 
