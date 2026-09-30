@@ -2,7 +2,7 @@
 name: glab-lean
 license: MIT
 compatibility: Needs python3 3.8+ and the glab CLI logged in to a GitLab host.
-description: Token-lean GitLab access through the `glab-lean` CLI. Use for ANY GitLab read or CI task before reaching for `glab api`, `glab mr view`, `glab ci trace`, or a GitLab MCP server — checking an MR's merge readiness, reading review threads, diffs, pipeline status, failed job logs, Terraform/OpenTofu plan output, waiting for a pipeline/job/MR to finish, running or retrying pipelines and manual jobs, merging, and replying to threads. Also use instead of writing jq/python over GitLab API JSON.
+description: Token-lean GitLab CLI. Use for ANY GitLab read or CI task instead of `glab api`, `glab mr view`, `glab ci trace`, or a GitLab MCP server. Core commands: `glab-lean mr [IID]` (merge readiness), `glab-lean pipe [ID]` (failed jobs with their error lines), `glab-lean job ID` (log errors and tail), `glab-lean tf JOB` (Terraform/OpenTofu plan), `glab-lean wait job|pipe|mr ID` (block until done), plus threads, diff, mrs, and `api PATH -f fields`. When you invoke this skill, send your first glab-lean command in the same message so loading it costs no extra round trip.
 ---
 
 # glab-lean
@@ -18,7 +18,8 @@ to target another repo.
 2. To wait for CI, run `glab-lean wait …` as a background command (in Claude Code, the Bash tool's
    `run_in_background: true`). You get notified when it exits. Don't write `sleep`/`until` loops
    and don't poll in the foreground.
-3. `glab-lean job` caches the full cleaned log and prints its path. For more detail, search that
+3. `glab-lean pipe` already prints the main error lines of up to three failed jobs; run
+   `glab-lean job` only when you need more. `glab-lean job` caches the full cleaned log and prints its path. For more detail, search that
    file. Don't fetch the trace again.
 4. For Terraform or OpenTofu, run `glab-lean tf`, then `glab-lean tf JOB -r ADDR` for one resource.
    Never print a whole plan log.

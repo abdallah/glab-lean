@@ -246,7 +246,7 @@ def job_log(job):
     return lines, path
 
 
-ERR = re.compile(r"(?i)(\berror\b|\bfatal\b|exception|traceback|\bfailed\b|\bfailure\b|exit code [1-9]|"
+ERR = re.compile(r"(?i)(\berror\b|\bfatal\b|exception|traceback|\bfail(ed|ure)?\b|exit code [1-9]|"
                  r"exit status [1-9]|permission denied|not found|timed? ?out|\bpanic\b)")
 NOISE = re.compile(r"(?i)(0 failed|failed=0|errors?: 0|--fail|ERROR_|allow_failure|set -e)")
 
@@ -293,19 +293,42 @@ def cmd_job(a):
         return
     # Default: error lines, then the tail.
     tail_n = 25 if j["status"] == "failed" else 8
-    body_end = len(lines)
-    for i in range(len(lines) - 1, -1, -1):  # ignore runner cleanup sections for the tail
-        if lines[i].startswith("== ") and re.search(r"upload_artifacts|cleanup|archive_cache", lines[i]):
-            body_end = i
-    hits = [i for i, l in enumerate(lines[:body_end]) if ERR.search(l) and not NOISE.search(l)
-            and not l.startswith("$ ")]
-    tail_from = max(0, body_end - tail_n)
+    end = body_end(lines)
+    hits = error_lines(lines, end)
+    tail_from = max(0, end - tail_n)
     hits = [i for i in hits if i < tail_from]
     if hits and j["status"] == "failed":
         print(f"-- error-like lines ({len(hits)}) --")
         show_hits(lines, hits, 0, a.max)
     print("-- tail --")
-    print("\n".join(l for l in lines[tail_from:body_end] if l))
+    print("\n".join(l for l in lines[tail_from:end] if l))
+
+
+def body_end(lines):
+    """Index where the runner's own cleanup sections start."""
+    end = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("== ") and re.search(r"upload_artifacts|cleanup|archive_cache", lines[i]):
+            end = i
+    return end
+
+
+def error_lines(lines, end):
+    return [i for i, l in enumerate(lines[:end]) if ERR.search(l) and not NOISE.search(l) and not l.startswith("$ ")]
+
+
+def error_excerpt(job, n=5):
+    """The last error-like lines of a job's log, topped up with its final lines, plus the log path."""
+    try:
+        lines, path = job_log(job)
+    except ApiError:
+        return [], None
+    end = body_end(lines)
+    idx = error_lines(lines, end)[-n:]
+    tail = [i for i in range(end) if lines[i].strip() and not lines[i].startswith("$ ") and i not in idx]
+    tail = tail[-(n - len(idx)):] if len(idx) < n else []
+    idx = sorted(idx + tail)
+    return [cut(lines[i], 200) for i in idx], path.replace(os.path.expanduser("~"), "~", 1)
 
 
 def show_hits(lines, hits, ctx, mx):
@@ -324,7 +347,7 @@ def show_hits(lines, hits, ctx, mx):
 
 # ---------------------------------------------------------------- pipelines
 
-def pipe_summary(pid, show_all=False):
+def pipe_summary(pid, show_all=False, errors=True):
     p, jobs, bridges = parallel(
         lambda: glab(f"projects/:id/pipelines/{pid}"),
         lambda: glab(f"projects/:id/pipelines/{pid}/jobs?per_page=100", paginate=True),
@@ -343,6 +366,12 @@ def pipe_summary(pid, show_all=False):
     print("jobs: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda x: -x[1])))
     order = {"failed": 0, "running": 1, "pending": 2, "manual": 3, "canceled": 4, "created": 5}
     rows = jobs if show_all else [j for j in jobs if j["status"] in order]
+    # Answer "which failed, and why" in one call: error lines for up to 3 blocking failures.
+    failed = [j for j in rows if j["status"] == "failed" and not j.get("allow_failure")][:3]
+    excerpts = {}
+    if failed and errors:
+        with cf.ThreadPoolExecutor(len(failed)) as ex:
+            excerpts = dict(zip((j["id"] for j in failed), ex.map(error_excerpt, failed)))
     groups = {}
     for j in sorted(rows, key=lambda j: (order.get(j["status"], 9), j["stage"], j["name"])):
         base = re.sub(r"[:\s]*\[[^\]]*\]$", "", j["name"]) if not show_all else j["id"]
@@ -356,6 +385,11 @@ def pipe_summary(pid, show_all=False):
             extra = " (allowed)" if j.get("allow_failure") and status == "failed" else ""
             reason = f"  {j['failure_reason']}" if j.get("failure_reason") and status == "failed" else ""
             print(f"  {j['id']}  {stage}/{j['name']}  {status}{extra}{reason}")
+            lines, path = excerpts.get(j["id"], ([], None))
+            for l in lines:
+                print(f"      | {l}")
+            if path:
+                print(f"      log: {path}")
     for b in bridges:
         d = b.get("downstream_pipeline") or {}
         print(f"  child {d.get('id', '-')} via {b['name']}  {d.get('status', b['status'])}")
@@ -363,7 +397,7 @@ def pipe_summary(pid, show_all=False):
 
 
 def cmd_pipe(a):
-    pipe_summary(resolve_pipe(a.id, a.mr, a.ref), a.all)
+    pipe_summary(resolve_pipe(a.id, a.mr, a.ref), a.all, not a.brief)
 
 
 def cmd_pipes(a):
@@ -856,6 +890,7 @@ def main():
     p.add_argument("--mr", nargs="?", const="", type=mr_iid, help="use the MR's head pipeline")
     p.add_argument("--ref")
     p.add_argument("--all", action="store_true", help="list every job")
+    p.add_argument("--brief", action="store_true", help="skip error lines for failed jobs")
     p.set_defaults(fn=cmd_pipe)
 
     p = sp.add_parser("pipes", help="list recent pipelines")
