@@ -142,7 +142,7 @@ $ glab-lean tf 5030 -r module.oidc.aws_iam_role.this   # only the changed lines
 | Command | Purpose |
 |---|---|
 | `mr`, `threads`, `diff`, `mrs` | MR readiness, unresolved threads, diffstat or file diffs, MR lists |
-| `pipe`, `pipes` | Pipeline summary with only non-green jobs; recent pipelines |
+| `pipe`, `pipes` | Pipeline summary with only non-green jobs, plus the main error lines of up to three failed jobs (`--brief` skips them); recent pipelines |
 | `job` | Job status, error lines, and tail; `--grep`, `--tail`, `--section` |
 | `tf` | Terraform/OpenTofu plan summary, drift, totals, and errors; `-r` for one resource |
 | `wait` | Wait silently for a job, pipeline, or MR to finish, then print the summary |
