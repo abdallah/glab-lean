@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""glab-lean: token-lean GitLab views for agents. Wraps `glab api` for auth and host.
+
+Every command prints a short, fixed-shape summary. Full job logs are cached on
+disk so follow-up searches use grep instead of another API call.
+"""
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+
+CACHE = os.path.expanduser(os.environ.get("GLAB_LEAN_CACHE", "~/.cache/glab-lean"))
+DONE_JOB = {"success", "failed", "canceled", "skipped", "manual"}
+DONE_PIPE = {"success", "failed", "canceled", "skipped", "manual", "blocked"}
+REPO = None
+
+
+# ---------------------------------------------------------------- API helpers
+
+class ApiError(Exception):
+    pass
+
+
+def glab(path, method="GET", body=None, raw=False, paginate=False):
+    cmd = ["glab", "api"]
+    if REPO:
+        cmd += ["-R", REPO]
+    if method != "GET":
+        cmd += ["-X", method]
+    if paginate:  # page by hand: `--output ndjson` needs a recent glab
+        rows, page = [], 1
+        sep = "&" if "?" in path else "?"
+        while True:
+            chunk = glab(f"{path}{sep}page={page}", method, body, raw)
+            rows.extend(chunk or [])
+            if not chunk or len(chunk) < per_page(path):
+                return rows
+            page += 1
+    inp = None
+    if body is not None:
+        cmd += ["-H", "Content-Type: application/json", "--input", "-"]
+        inp = json.dumps(body).encode()
+    cmd.append(path)
+    p = subprocess.run(cmd, input=inp, capture_output=True)
+    if p.returncode != 0:
+        msg = (p.stderr or p.stdout).decode(errors="replace").strip().splitlines()
+        raise ApiError(f"{method} {path}: {msg[-1] if msg else 'failed'}")
+    out = p.stdout.decode(errors="replace")
+    if raw:
+        return out
+    return json.loads(out) if out.strip() else None
+
+
+def per_page(path):
+    m = re.search(r"[?&]per_page=(\d+)", path)
+    return int(m.group(1)) if m else 20
+
+
+def q(**kw):
+    return urllib.parse.urlencode({k: v for k, v in kw.items() if v is not None}, doseq=True)
+
+
+def enc(s):
+    return urllib.parse.quote(str(s), safe="")
+
+
+def parallel(*fns):
+    with cf.ThreadPoolExecutor(len(fns)) as ex:
+        futs = [ex.submit(f) for f in fns]
+    out = []
+    for f in futs:
+        try:
+            out.append(f.result())
+        except ApiError:
+            out.append(None)
+    return out
+
+
+def branch():
+    p = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit("glab-lean: not in a git repo; pass an ID or -R group/project")
+    return p.stdout.strip()
+
+
+def dur(s):
+    if s is None:
+        return "-"
+    s = int(s)
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+
+
+def cut(s, n):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def dig(d, key):
+    for k in key.split("."):
+        d = d.get(k) if isinstance(d, dict) else None
+    return d
+
+
+# ---------------------------------------------------------------- resolution
+
+def resolve_mr(iid):
+    if iid:
+        return int(str(iid).lstrip("!"))
+    b = branch()
+    mrs = glab(f"projects/:id/merge_requests?{q(source_branch=b, state='opened')}")
+    if not mrs:
+        sys.exit(f"glab-lean: no open MR for branch {b}")
+    return mrs[0]["iid"]
+
+
+def resolve_pipe(pid=None, mr=None, ref=None):
+    if pid:
+        return int(pid)
+    if mr is not None:
+        m = glab(f"projects/:id/merge_requests/{resolve_mr(mr)}")
+        if not m.get("head_pipeline"):
+            sys.exit(f"glab-lean: !{m['iid']} has no pipeline yet")
+        return m["head_pipeline"]["id"]
+    ref = ref or branch()
+    ps = glab(f"projects/:id/pipelines?{q(ref=ref, per_page=1)}")
+    if ps:
+        return ps[0]["id"]
+    return resolve_pipe(mr="")  # fall back to the branch's MR pipeline
+
+
+# ---------------------------------------------------------------- job logs
+
+TS = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z [0-9a-f]{2}[OE](\+| )?")
+SECTION = re.compile(r"section_(start|end):\d+:([^\r\s\[]+)(\[[^\]]*\])?\r?(\x1b\[0K)?")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+
+def clean_log(raw):
+    out = []
+    for line in raw.split("\n"):
+        m = TS.match(line)
+        cont = bool(m and m.group(1) == "+")
+        if m:
+            line = line[m.end():]
+
+        def sec(mm):
+            return f"\n== {mm.group(2)}\n" if mm.group(1) == "start" else ""
+
+        line = SECTION.sub(sec, line)
+        line = ANSI.sub("", line)
+        parts = []
+        for seg in line.split("\n"):
+            if "\r" in seg:
+                segs = [x for x in seg.split("\r") if x.strip()]
+                seg = segs[-1] if segs else ""
+            parts.append(seg.rstrip())
+        if cont and out:
+            out[-1] += parts[0]
+            parts = parts[1:]
+        out.extend(parts)
+    return [l for i, l in enumerate(out) if l or (i and out[i - 1])]
+
+
+def job_meta(jid):
+    return glab(f"projects/:id/jobs/{jid}")
+
+
+def job_log(job):
+    """Return (lines, cache_path). Finished jobs are read from and written to cache."""
+    m = re.match(r"https?://([^/]+)/(.+?)/-/jobs/", job["web_url"])
+    slug = (m.group(1) + "/" + m.group(2)).replace("/", "_") if m else "unknown"
+    path = os.path.join(CACHE, slug, f"{job['id']}.log")
+    done = job["status"] in DONE_JOB - {"manual"}
+    if done and os.path.exists(path):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().split("\n"), path
+    lines = clean_log(glab(f"projects/:id/jobs/{job['id']}/trace", raw=True))
+    # Logs can hold secrets a job printed: keep the cache private to the user.
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return lines, path
+
+
+ERR = re.compile(r"(?i)(\berror\b|\bfatal\b|exception|traceback|\bfailed\b|\bfailure\b|exit code [1-9]|"
+                 r"exit status [1-9]|permission denied|not found|timed? ?out|\bpanic\b)")
+NOISE = re.compile(r"(?i)(0 failed|failed=0|errors?: 0|--fail|ERROR_|allow_failure|set -e)")
+
+
+def job_header(j):
+    reason = f"  reason {j['failure_reason']}" if j.get("failure_reason") else ""
+    af = " (allowed to fail)" if j.get("allow_failure") and j["status"] == "failed" else ""
+    return (f"job {j['id']} {j['name']} [{j['stage']}] {j['status']}{af}  {dur(j.get('duration'))}"
+            f"  pipeline {j['pipeline']['id']}  ref {j['ref']}{reason}")
+
+
+def cmd_job(a):
+    j = job_meta(a.id)
+    print(job_header(j))
+    if j["status"] in ("created", "pending", "manual", "skipped"):
+        return
+    lines, path = job_log(j)
+    print(f"log: {path} ({len(lines)} lines; grep it directly for more)")
+    if a.sections:
+        starts = [(i, l[3:]) for i, l in enumerate(lines) if l.startswith("== ")]
+        for n, (i, name) in enumerate(starts):
+            end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+            print(f"  {name}  lines {i + 1}-{end} ({end - i})")
+        return
+    if a.section:
+        on = False
+        for l in lines:
+            if l.startswith("== "):
+                on = a.section in l[3:]
+            elif on:
+                print(l)
+        return
+    if a.full:
+        print("\n".join(lines))
+        return
+    if a.grep:
+        rx = re.compile(a.grep)
+        hits = [i for i, l in enumerate(lines) if rx.search(l)]
+        show_hits(lines, hits, a.context, a.max)
+        return
+    if a.tail or a.head:
+        sel = lines[: a.head] if a.head else lines[-a.tail:]
+        print("\n".join(sel))
+        return
+    # Default: error lines, then the tail.
+    tail_n = 25 if j["status"] == "failed" else 8
+    body_end = len(lines)
+    for i in range(len(lines) - 1, -1, -1):  # ignore runner cleanup sections for the tail
+        if lines[i].startswith("== ") and re.search(r"upload_artifacts|cleanup|archive_cache", lines[i]):
+            body_end = i
+    hits = [i for i, l in enumerate(lines[:body_end]) if ERR.search(l) and not NOISE.search(l)
+            and not l.startswith("$ ")]
+    tail_from = max(0, body_end - tail_n)
+    hits = [i for i in hits if i < tail_from]
+    if hits and j["status"] == "failed":
+        print(f"-- error-like lines ({len(hits)}) --")
+        show_hits(lines, hits, 0, a.max)
+    print("-- tail --")
+    print("\n".join(l for l in lines[tail_from:body_end] if l))
+
+
+def show_hits(lines, hits, ctx, mx):
+    if len(hits) > mx:
+        print(f"({len(hits)} matches, showing last {mx}; raise --max or grep the log file)")
+        hits = hits[-mx:]
+    last = -2
+    for i in hits:
+        lo, hi = max(0, i - ctx), min(len(lines), i + ctx + 1)
+        if ctx and lo > last + 1:
+            print("--")
+        for k in range(max(lo, last + 1), hi):
+            print(f"{k + 1}: {cut(lines[k], 400)}")
+        last = hi - 1
+
+
+# ---------------------------------------------------------------- pipelines
+
+def pipe_summary(pid, show_all=False):
+    p, jobs, bridges = parallel(
+        lambda: glab(f"projects/:id/pipelines/{pid}"),
+        lambda: glab(f"projects/:id/pipelines/{pid}/jobs?per_page=100", paginate=True),
+        lambda: glab(f"projects/:id/pipelines/{pid}/bridges?per_page=100", paginate=True),
+    )
+    if p is None:
+        sys.exit(f"glab-lean: pipeline {pid} not found")
+    jobs, bridges = jobs or [], bridges or []
+    print(f"pipeline {p['id']} {p['status']}  ref {p['ref']}  sha {p['sha'][:8]}  {dur(p.get('duration'))}"
+          f"  source {p.get('source')}\n{p['web_url']}")
+    counts = {}
+    for j in jobs:
+        counts[j["status"]] = counts.get(j["status"], 0) + 1
+    print("jobs: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda x: -x[1])))
+    order = {"failed": 0, "running": 1, "pending": 2, "manual": 3, "canceled": 4, "created": 5}
+    rows = jobs if show_all else [j for j in jobs if j["status"] in order]
+    groups = {}
+    for j in sorted(rows, key=lambda j: (order.get(j["status"], 9), j["stage"], j["name"])):
+        base = re.sub(r"[:\s]*\[[^\]]*\]$", "", j["name"]) if not show_all else j["id"]
+        groups.setdefault((j["status"], j["stage"], base), []).append(j)
+    for (status, stage, base), js in groups.items():
+        if len(js) > 3:  # parallel:matrix fan-out: one line per group
+            ids = sorted(j["id"] for j in js)
+            print(f"  {ids[0]}..{ids[-1]}  {stage}/{base} ×{len(js)}  {status}  (--all for each)")
+            continue
+        for j in js:
+            extra = " (allowed)" if j.get("allow_failure") and status == "failed" else ""
+            reason = f"  {j['failure_reason']}" if j.get("failure_reason") and status == "failed" else ""
+            print(f"  {j['id']}  {stage}/{j['name']}  {status}{extra}{reason}")
+    for b in bridges:
+        d = b.get("downstream_pipeline") or {}
+        print(f"  child {d.get('id', '-')} via {b['name']}  {d.get('status', b['status'])}")
+    return p
+
+
+def cmd_pipe(a):
+    pipe_summary(resolve_pipe(a.id, a.mr, a.ref), a.all)
+
+
+def cmd_pipes(a):
+    ps = glab(f"projects/:id/pipelines?{q(ref=a.ref, status=a.status, per_page=a.limit)}")
+    for p in ps:
+        print(f"{p['id']}  {p['status']:9} {p['source']:22} {p['created_at'][:16]}  {p['ref']}")
+
+
+# ---------------------------------------------------------------- waiting
+
+def cmd_wait(a):
+    deadline = time.time() + a.timeout
+    until = set(a.until.split(",")) if a.until else None
+    last = None
+    while True:
+        try:
+            if a.kind == "job":
+                j = job_meta(a.id)
+                st, done = j["status"], (j["status"] in until if until else j["status"] in DONE_JOB)
+            elif a.kind == "pipe":
+                p = glab(f"projects/:id/pipelines/{a.id}")
+                st, done = p["status"], (p["status"] in until if until else p["status"] in DONE_PIPE)
+            else:
+                m = glab(f"projects/:id/merge_requests/{resolve_mr(a.id)}")
+                hp = m.get("head_pipeline") or {}
+                if until:
+                    st = m["state"]
+                    done = st in until or m.get("detailed_merge_status") in until
+                else:
+                    st = hp.get("status", "no-pipeline")
+                    done = st in DONE_PIPE and on_head(hp, m)
+            last = st
+        except ApiError as e:
+            last = f"api-error: {e}"
+            done = False
+        if done:
+            break
+        if time.time() > deadline:
+            print(f"timeout after {a.timeout}s; last status: {last}")
+            sys.exit(124)
+        time.sleep(a.every)
+    if a.kind == "job":
+        cmd_job(argparse.Namespace(id=a.id, sections=False, section=None, full=False, grep=None,
+                                   tail=None, head=None, max=30, context=0))
+    elif a.kind == "pipe":
+        pipe_summary(a.id)
+    elif until:
+        print(f"!{m['iid']} {m['state']} merge_status {m.get('detailed_merge_status')}")
+    else:
+        pipe_summary(hp["id"])
+    sys.exit(0 if last in ("success", "merged", "manual") or until else 1)
+
+
+# ---------------------------------------------------------------- merge requests
+
+def diff_stat(d):
+    add = sum(1 for l in d.get("diff", "").splitlines() if l.startswith("+") and not l.startswith("+++"))
+    rem = sum(1 for l in d.get("diff", "").splitlines() if l.startswith("-") and not l.startswith("---"))
+    tag = " (new)" if d.get("new_file") else " (deleted)" if d.get("deleted_file") else \
+        f" (from {d['old_path']})" if d.get("renamed_file") else ""
+    return add, rem, f"{d['new_path']}{tag}"
+
+
+def get_diffs(iid):
+    try:
+        return glab(f"projects/:id/merge_requests/{iid}/diffs?per_page=100", paginate=True)
+    except ApiError:
+        return glab(f"projects/:id/merge_requests/{iid}/changes")["changes"]
+
+
+def on_head(hp, m):
+    # Merged-results pipelines run on a merge commit, so their sha never equals the MR head.
+    return hp.get("sha") == m["sha"] or str(hp.get("ref", "")).startswith("refs/merge-requests/")
+
+
+def unresolved(discs):
+    return [d for d in discs if any(n.get("resolvable") and not n.get("resolved") for n in d["notes"])]
+
+
+def cmd_mr(a):
+    iid = resolve_mr(a.iid)
+    m, appr, discs, diffs = parallel(
+        lambda: glab(f"projects/:id/merge_requests/{iid}"),
+        lambda: glab(f"projects/:id/merge_requests/{iid}/approvals"),
+        lambda: glab(f"projects/:id/merge_requests/{iid}/discussions?per_page=100", paginate=True),
+        lambda: get_diffs(iid),
+    )
+    if m is None:
+        sys.exit(f"glab-lean: MR !{iid} not found")
+    draft = " [draft]" if m.get("draft") else ""
+    print(f"!{m['iid']}{draft} {m['title']}")
+    print(f"{m['state']}  {m['source_branch']} → {m['target_branch']}  by @{m['author']['username']}"
+          f"  updated {m['updated_at'][:16]}\n{m['web_url']}")
+    blockers = []
+    ms = m.get("detailed_merge_status") or m.get("merge_status")
+    if m["state"] == "opened" and ms != "mergeable":
+        blockers.append(ms)
+    if m.get("has_conflicts"):
+        blockers.append("conflicts")
+    if appr:
+        left = appr.get("approvals_left", 0)
+        by = ",".join("@" + x["user"]["username"] for x in appr.get("approved_by", [])) or "none"
+        print(f"approvals: {left} left, approved by {by}")
+    hp = m.get("head_pipeline")
+    if hp:
+        stale = "" if on_head(hp, m) else " (not on latest commit)"
+        print(f"pipeline {hp['id']} {hp['status']}{stale}")
+    else:
+        print("pipeline: none")
+    ur = unresolved(discs or [])
+    total = sum(1 for d in (discs or []) if any(n.get("resolvable") for n in d["notes"]))
+    print(f"threads: {len(ur)} unresolved of {total}")
+    if m["state"] == "opened":
+        print("ready to merge" if not blockers else "blocked: " + ", ".join(blockers))
+    elif m["state"] == "merged":
+        print(f"merged {str(m.get('merged_at'))[:16]}  sha {(m.get('squash_commit_sha') or m.get('merge_commit_sha') or '')[:8]}")
+    meta = []
+    if m.get("labels"):
+        meta.append("labels " + ",".join(m["labels"]))
+    if m.get("reviewers"):
+        meta.append("reviewers " + ",".join("@" + r["username"] for r in m["reviewers"]))
+    if meta:
+        print("  ".join(meta))
+    if diffs is not None:
+        stats = [diff_stat(d) for d in diffs]
+        print(f"files ({len(stats)}, +{sum(s[0] for s in stats)} -{sum(s[1] for s in stats)}):")
+        for add, rem, name in stats[: a.files]:
+            print(f"  +{add} -{rem}  {name}")
+        if len(stats) > a.files:
+            print(f"  … {len(stats) - a.files} more (glab-lean diff {iid})")
+    desc = (m.get("description") or "").strip()
+    if desc and a.desc != 0:
+        dl = desc.splitlines()
+        n = len(dl) if a.desc < 0 else a.desc
+        print("description:")
+        print("\n".join("  " + cut(l, 200) for l in dl[:n]))
+        if len(dl) > n:
+            print(f"  … {len(dl) - n} more lines (--desc -1)")
+
+
+def cmd_diff(a):
+    iid = resolve_mr(a.iid)
+    diffs = get_diffs(iid)
+    if not a.paths:
+        for d in diffs:
+            add, rem, name = diff_stat(d)
+            print(f"+{add} -{rem}  {name}")
+        return
+    for d in diffs:
+        if not any(p in d["new_path"] or p in d["old_path"] for p in a.paths):
+            continue
+        lines = d.get("diff", "").splitlines()
+        print(f"--- {d['old_path']}\n+++ {d['new_path']}")
+        print("\n".join(lines[: a.max]))
+        if len(lines) > a.max:
+            print(f"… {len(lines) - a.max} more lines (--max)")
+
+
+def cmd_threads(a):
+    iid = resolve_mr(a.iid)
+    discs = glab(f"projects/:id/merge_requests/{iid}/discussions?per_page=100", paginate=True)
+    if not a.all:
+        discs = unresolved(discs)
+    discs = [d for d in discs if not all(n.get("system") for n in d["notes"])]
+    if a.general:
+        discs = [d for d in discs if not any(n.get("resolvable") for n in d["notes"])]
+    print(f"!{iid}: {len(discs)} {'threads' if a.all else 'unresolved threads'}")
+    lim = 100000 if a.full else 400
+    for d in discs:
+        n0 = d["notes"][0]
+        pos = n0.get("position") or {}
+        loc = f"{pos.get('new_path') or pos.get('old_path')}:{pos.get('new_line') or pos.get('old_line')}" \
+            if pos else "general"
+        res = " resolved" if all(n.get("resolved") for n in d["notes"] if n.get("resolvable")) and \
+            any(n.get("resolvable") for n in d["notes"]) else ""
+        print(f"\n[{d['id']}] {loc}  @{n0['author']['username']} {n0['created_at'][:10]}"
+              f"  ({len(d['notes'])} notes){res}")
+        print("  " + (n0["body"] if a.full else cut(n0["body"], lim)))
+        replies = d["notes"][1:] if a.full else d["notes"][-1:] if len(d["notes"]) > 1 else []
+        for n in replies:
+            print(f"  ↳ @{n['author']['username']}: {n['body'] if a.full else cut(n['body'], 250)}")
+
+
+def cmd_mrs(a):
+    p = {"state": a.state, "per_page": a.limit, "order_by": "updated_at"}
+    if a.mine:
+        p["scope"] = "created_by_me"
+    if a.review:
+        p["reviewer_username"] = a.review
+    if a.source:
+        p["source_branch"] = a.source
+    if a.search:
+        p["search"] = a.search
+    base = "merge_requests" if a.everywhere else "projects/:id/merge_requests"
+    for m in glab(f"{base}?{q(**p)}"):
+        draft = "draft " if m.get("draft") else ""
+        where = m["references"]["full"] if a.everywhere else f"!{m['iid']}"
+        print(f"{where}  {draft}{m['updated_at'][:10]}  @{m['author']['username']}  "
+              f"{m['source_branch']}  {cut(m['title'], 90)}")
+
+
+# ---------------------------------------------------------------- terraform
+
+TF_HDR = re.compile(r"^\s*# (.+?) (will be created|will be destroyed|will be updated in-place|must be replaced|"
+                    r"will be replaced.*|is tainted.*|will be read during apply|has moved to .+|"
+                    r"will no longer be managed.*|will be imported.*|has changed|has been deleted)"
+                    r"(\s*\(.*\))?$")
+SYM = {"will be created": "+", "will be destroyed": "-", "will be updated in-place": "~",
+       "must be replaced": "-/+", "will be read during apply": "<=", "has changed": "drift~",
+       "has been deleted": "drift-"}
+TF_END = re.compile(r"^(Plan: |No changes\.|Changes to Outputs:|Apply complete!|Destroy complete!|"
+                    r"─{10}|Saved the plan|Warning: |Terraform will perform|OpenTofu will perform)")
+TF_TOTAL = re.compile(r"^(Plan: .*|No changes\..*|Apply complete!.*|Destroy complete!.*)")
+TF_ERR = re.compile(r"^[│|]?\s*Error: ")
+
+
+def tf_parse(lines):
+    res, totals, errs = [], [], []
+    for i, l in enumerate(lines):
+        m = TF_HDR.match(l)
+        if m:
+            what = m.group(2)
+            sym = SYM.get(what) or ("->" if what.startswith("has moved") else
+                                    "-/+" if "replace" in what or "tainted" in what else what)
+            note = f"  {what}" if sym == what or what.startswith("has moved") else ""
+            res.append((i, sym, m.group(1) + note))
+        elif TF_TOTAL.match(l):
+            totals.append(l.strip())
+        elif TF_ERR.match(l):
+            block = [l.strip("│ ")]
+            for k in range(i + 1, min(i + 8, len(lines))):
+                s = lines[k].strip("│ ╵")
+                if not s and len(block) > 1:
+                    break
+                if s:
+                    block.append(s)
+            errs.append(" | ".join(block))
+    return res, totals, errs
+
+
+def tf_block(lines, start, full):
+    out = [lines[start].strip()]
+    for l in lines[start + 1:]:
+        if TF_HDR.match(l) or TF_END.match(l.strip()):
+            break
+        s = l.strip()
+        if full or (s[:1] in "+-~" or s.startswith("<=") or "forces replacement" in s):
+            out.append(l)
+    return out
+
+
+def tf_jobs(a):
+    if a.job:
+        return [a.job]
+    pid = resolve_pipe(a.pipe, a.mr)
+    jobs = glab(f"projects/:id/pipelines/{pid}/jobs?per_page=100", paginate=True)
+    rx = re.compile(a.name, re.I)
+    sel = [j["id"] for j in jobs if rx.search(j["name"]) and j["status"] not in ("created", "manual", "skipped")]
+    if not sel:
+        names = ", ".join(sorted({f"{j['name']}({j['status']})" for j in jobs}))
+        sys.exit(f"glab-lean: no finished jobs matching /{a.name}/ in pipeline {pid}; jobs: {cut(names, 300) or 'none (external or empty pipeline)'}")
+    return sel
+
+
+def cmd_tf(a):
+    for jid in tf_jobs(a):
+        j = job_meta(jid)
+        lines, path = job_log(j)
+        res, totals, errs = tf_parse(lines)
+        print(f"{job_header(j)}\nlog: {path}")
+        if a.resource:
+            hits = [r for r in res if a.resource in r[2]]
+            if not hits:
+                print(f"  no resource matching {a.resource!r}")
+            for i, _, _ in hits:
+                print("\n".join(tf_block(lines, i, a.full)))
+            continue
+        drift = [r for r in res if r[1].startswith("drift")]
+        plan = [r for r in res if not r[1].startswith("drift")]
+        if drift:
+            print(f"drift outside Terraform ({len(drift)}):")
+            for _, s, name in drift[: a.max]:
+                print(f"  {s[5:]:3} {name}")
+        for _, s, name in plan[: a.max]:
+            print(f"  {s:3} {name}")
+        if len(plan) > a.max:
+            print(f"  … {len(plan) - a.max} more (--max)")
+        for t in totals:
+            print(t)
+        for e in errs[:10]:
+            print(cut(e, 500))
+        if not (plan or totals or errs):
+            print("  no plan output found; try `glab-lean job` on it")
+
+
+# ---------------------------------------------------------------- actions
+
+def kv(pairs):
+    out = []
+    for s in pairs or []:
+        k, _, v = s.partition("=")
+        out.append({"key": k, "value": v})
+    return out
+
+
+def cmd_run(a):
+    body = {"ref": a.ref or branch()}
+    if a.var:
+        body["variables"] = kv(a.var)
+    p = glab("projects/:id/pipeline", "POST", body)
+    print(f"pipeline {p['id']} {p['status']}  ref {p['ref']}\n{p['web_url']}")
+
+
+def cmd_play(a):
+    body = {"job_variables_attributes": kv(a.var)} if a.var else None
+    j = glab(f"projects/:id/jobs/{a.id}/play", "POST", body)
+    print(f"job {j['id']} {j['name']} {j['status']}")
+
+
+def cmd_retry(a):
+    if a.pipe:
+        p = glab(f"projects/:id/pipelines/{a.id}/retry", "POST")
+        print(f"pipeline {p['id']} {p['status']} (failed jobs retried)")
+    else:
+        j = glab(f"projects/:id/jobs/{a.id}/retry", "POST")
+        print(f"new job {j['id']} {j['name']} {j['status']}")
+
+
+def cmd_cancel(a):
+    kind = "pipelines" if a.pipe else "jobs"
+    r = glab(f"projects/:id/{kind}/{a.id}/cancel", "POST")
+    print(f"{kind[:-1]} {r['id']} {r['status']}")
+
+
+def cmd_merge(a):
+    iid = resolve_mr(a.iid)
+    body = {}
+    if a.squash:
+        body["squash"] = True
+    if a.rm_branch:
+        body["should_remove_source_branch"] = True
+    if a.auto:
+        body["merge_when_pipeline_succeeds"] = True
+    m = glab(f"projects/:id/merge_requests/{iid}/merge", "PUT", body)
+    sha = (m.get("squash_commit_sha") or m.get("merge_commit_sha") or "")[:8]
+    auto = "  auto-merge set" if m.get("merge_when_pipeline_succeeds") and m["state"] != "merged" else ""
+    print(f"!{iid} {m['state']}{auto}  {sha}")
+
+
+def body_arg(s):
+    return sys.stdin.read() if s == "-" else s
+
+
+def cmd_note(a):
+    iid = resolve_mr(a.iid)
+    n = glab(f"projects/:id/merge_requests/{iid}/notes", "POST", {"body": body_arg(a.body)})
+    print(f"note {n['id']} on !{iid}")
+
+
+def cmd_reply(a):
+    iid = resolve_mr(a.iid)
+    n = glab(f"projects/:id/merge_requests/{iid}/discussions/{a.disc}/notes", "POST", {"body": body_arg(a.body)})
+    print(f"reply {n['id']} in {a.disc[:8]} on !{iid}")
+    if a.resolve:
+        glab(f"projects/:id/merge_requests/{iid}/discussions/{a.disc}?resolved=true", "PUT")
+        print("resolved")
+
+
+def cmd_resolve(a):
+    iid = resolve_mr(a.iid)
+    val = "false" if a.undo else "true"
+    glab(f"projects/:id/merge_requests/{iid}/discussions/{a.disc}?resolved={val}", "PUT")
+    print(f"{a.disc[:8]} {'unresolved' if a.undo else 'resolved'}")
+
+
+# ---------------------------------------------------------------- generic API
+
+def cmd_api(a):
+    path = a.path
+    data = glab(path, paginate=a.paginate)
+    if isinstance(data, dict) and not a.fields:
+        for k, v in data.items():
+            if not isinstance(v, (dict, list)) and v not in (None, "", False):
+                print(f"{k}: {cut(str(v), 200)}")
+            elif isinstance(v, dict) and ("id" in v or "status" in v):
+                print(f"{k}: " + " ".join(f"{kk}={v[kk]}" for kk in ("id", "iid", "status", "name") if kk in v))
+        return
+    rows = data if isinstance(data, list) else [data]
+    for w in a.where or []:
+        mm = re.match(r"([\w.]+)(!=|=|~)(.*)", w)
+        if not mm:
+            sys.exit(f"glab-lean: bad --where {w!r}; use key=val, key!=val or key~regex")
+        k, op, v = mm.groups()
+        if op == "=":
+            rows = [r for r in rows if str(dig(r, k)) == v]
+        elif op == "!=":
+            rows = [r for r in rows if str(dig(r, k)) != v]
+        else:
+            rows = [r for r in rows if re.search(v, str(dig(r, k)))]
+    fields = a.fields.split(",") if a.fields else \
+        [f for f in ("id", "iid", "name", "title", "status", "state", "ref", "stage") if rows and f in rows[0]]
+    for r in rows[: a.limit]:
+        print("\t".join(cut(str(dig(r, f)), 120) for f in fields))
+    if len(rows) > a.limit:
+        print(f"… {len(rows) - a.limit} more (--limit)", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- CLI
+
+def main():
+    global REPO
+    ap = argparse.ArgumentParser(prog="glab-lean", description="Token-lean GitLab views. IDs default to the current branch.")
+    ap.add_argument("-R", "--repo", help="group/project (default: current git repo)")
+    common = argparse.ArgumentParser(add_help=False)  # accept -R after the subcommand too
+    common.add_argument("-R", "--repo", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    _add = sp.add_parser
+    sp.add_parser = lambda *x, **k: _add(*x, parents=[common], **k)
+
+    p = sp.add_parser("mr", help="MR summary: merge readiness, pipeline, threads, files")
+    p.add_argument("iid", nargs="?")
+    p.add_argument("--desc", type=int, default=8, help="description lines (0 none, -1 all)")
+    p.add_argument("--files", type=int, default=15)
+    p.set_defaults(fn=cmd_mr)
+
+    p = sp.add_parser("diff", help="MR diffstat, or diffs of files matching PATHS")
+    p.add_argument("iid", nargs="?")
+    p.add_argument("paths", nargs="*")
+    p.add_argument("--max", type=int, default=300, help="max lines per file")
+    p.set_defaults(fn=cmd_diff)
+
+    p = sp.add_parser("threads", help="unresolved MR threads, one block each")
+    p.add_argument("iid", nargs="?")
+    p.add_argument("--all", action="store_true", help="include resolved and general comments")
+    p.add_argument("--general", action="store_true", help="only non-resolvable comments (use with --all)")
+    p.add_argument("--full", action="store_true", help="untruncated bodies and every reply")
+    p.set_defaults(fn=cmd_threads)
+
+    p = sp.add_parser("mrs", help="list MRs")
+    p.add_argument("--state", default="opened")
+    p.add_argument("--mine", action="store_true")
+    p.add_argument("--review", metavar="USER")
+    p.add_argument("--source", metavar="BRANCH")
+    p.add_argument("--search")
+    p.add_argument("--everywhere", action="store_true", help="all projects, not only this one")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_mrs)
+
+    p = sp.add_parser("pipe", help="pipeline summary: counts plus non-green jobs")
+    p.add_argument("id", nargs="?")
+    p.add_argument("--mr", nargs="?", const="", help="use the MR's head pipeline")
+    p.add_argument("--ref")
+    p.add_argument("--all", action="store_true", help="list every job")
+    p.set_defaults(fn=cmd_pipe)
+
+    p = sp.add_parser("pipes", help="list recent pipelines")
+    p.add_argument("--ref")
+    p.add_argument("--status")
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(fn=cmd_pipes)
+
+    p = sp.add_parser("job", help="job status and log extract; full log cached on disk")
+    p.add_argument("id")
+    p.add_argument("--grep", metavar="RE")
+    p.add_argument("-C", "--context", type=int, default=0)
+    p.add_argument("--tail", type=int)
+    p.add_argument("--head", type=int)
+    p.add_argument("--sections", action="store_true", help="list log sections")
+    p.add_argument("--section", metavar="NAME", help="print one section")
+    p.add_argument("--full", action="store_true")
+    p.add_argument("--max", type=int, default=30)
+    p.set_defaults(fn=cmd_job)
+
+    p = sp.add_parser("wait", help="block silently until a job/pipeline/MR settles, then summarize")
+    p.add_argument("kind", choices=["job", "pipe", "mr"])
+    p.add_argument("id", nargs="?")
+    p.add_argument("--until", help="comma-separated states to stop on (MR: merged, mergeable, …)")
+    p.add_argument("--every", type=int, default=20, help="poll interval seconds")
+    p.add_argument("--timeout", type=int, default=3600)
+    p.set_defaults(fn=cmd_wait)
+
+    p = sp.add_parser("tf", help="Terraform/OpenTofu plan summary from job logs")
+    p.add_argument("job", nargs="?")
+    p.add_argument("--pipe")
+    p.add_argument("--mr", nargs="?", const="")
+    p.add_argument("--name", default="plan", help="job-name regex when using --pipe/--mr")
+    p.add_argument("-r", "--resource", help="show the change block for resources containing this")
+    p.add_argument("--full", action="store_true", help="with -r: include unchanged lines")
+    p.add_argument("--max", type=int, default=60)
+    p.set_defaults(fn=cmd_tf)
+
+    p = sp.add_parser("run", help="create a pipeline")
+    p.add_argument("--ref")
+    p.add_argument("-v", "--var", action="append", metavar="K=V")
+    p.set_defaults(fn=cmd_run)
+
+    p = sp.add_parser("play", help="start a manual job")
+    p.add_argument("id")
+    p.add_argument("-v", "--var", action="append", metavar="K=V")
+    p.set_defaults(fn=cmd_play)
+
+    p = sp.add_parser("retry", help="retry a job, or a pipeline's failed jobs with --pipe")
+    p.add_argument("id")
+    p.add_argument("--pipe", action="store_true")
+    p.set_defaults(fn=cmd_retry)
+
+    p = sp.add_parser("cancel", help="cancel a job, or a pipeline with --pipe")
+    p.add_argument("id")
+    p.add_argument("--pipe", action="store_true")
+    p.set_defaults(fn=cmd_cancel)
+
+    p = sp.add_parser("merge", help="merge an MR (or set auto-merge)")
+    p.add_argument("iid", nargs="?")
+    p.add_argument("--squash", action="store_true")
+    p.add_argument("--rm-branch", action="store_true")
+    p.add_argument("--auto", action="store_true", help="merge when the pipeline succeeds")
+    p.set_defaults(fn=cmd_merge)
+
+    p = sp.add_parser("note", help="comment on an MR (body '-' reads stdin)")
+    p.add_argument("iid")
+    p.add_argument("body")
+    p.set_defaults(fn=cmd_note)
+
+    p = sp.add_parser("reply", help="reply to an MR thread")
+    p.add_argument("iid")
+    p.add_argument("disc")
+    p.add_argument("body")
+    p.add_argument("--resolve", action="store_true")
+    p.set_defaults(fn=cmd_reply)
+
+    p = sp.add_parser("resolve", help="resolve an MR thread")
+    p.add_argument("iid")
+    p.add_argument("disc")
+    p.add_argument("--undo", action="store_true")
+    p.set_defaults(fn=cmd_resolve)
+
+    p = sp.add_parser("api", help="GET any endpoint as TSV/key: value (replaces jq/python glue)")
+    p.add_argument("path", help="e.g. 'projects/:id/pipelines?ref=main'")
+    p.add_argument("-f", "--fields", help="comma list; dots for nesting (pipeline.id)")
+    p.add_argument("-w", "--where", action="append", help="key=val, key!=val, key~regex")
+    p.add_argument("--paginate", action="store_true")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(fn=cmd_api)
+
+    a = ap.parse_args()
+    REPO = a.repo
+    try:
+        a.fn(a)
+    except ApiError as e:
+        sys.exit(f"glab-lean: {e}")
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
