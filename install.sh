@@ -20,6 +20,9 @@ command -v glab >/dev/null || echo "warning: glab not found on PATH; install it 
 
 place() {  # place SRC DEST
   mkdir -p "$(dirname "$2")"
+  if { [ -e "$2" ] || [ -L "$2" ]; } && [ "$(readlink "$2" 2>/dev/null)" != "$1" ]; then
+    echo "  replacing existing $2" >&2
+  fi
   if [ "$mode" = copy ]; then
     rm -f "$2"
     cp "$1" "$2"

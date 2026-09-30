@@ -62,6 +62,9 @@ def glab(path, method="GET", body=None, raw=False, paginate=False):
         inp = json.dumps(body).encode()
     cmd.append(path)
     p = subprocess.run(cmd, input=inp, capture_output=True)
+    if p.returncode != 0 and method == "GET":  # one retry: parallel glab calls fail now and then
+        time.sleep(1)
+        p = subprocess.run(cmd, input=inp, capture_output=True)
     if p.returncode != 0:
         msg = (p.stderr or p.stdout).decode(errors="replace").strip().splitlines()
         raise ApiError(f"{method} {path}: {msg[-1] if msg else 'failed'}")
@@ -141,10 +144,11 @@ def resolve_pipe(pid=None, mr=None, ref=None):
         if not m.get("head_pipeline"):
             sys.exit(f"glab-lean: !{m['iid']} has no pipeline yet")
         return m["head_pipeline"]["id"]
-    ref = ref or branch()
-    ps = glab(f"projects/:id/pipelines?{q(ref=ref, per_page=1)}")
+    ps = glab(f"projects/:id/pipelines?{q(ref=ref or branch(), per_page=1)}")
     if ps:
         return ps[0]["id"]
+    if ref:
+        sys.exit(f"glab-lean: no pipelines for ref {ref}")
     return resolve_pipe(mr="")  # fall back to the branch's MR pipeline
 
 
@@ -218,6 +222,8 @@ def job_log(job):
         with open(path, encoding="utf-8", errors="replace") as f:
             return f.read().split("\n"), path
     lines = clean_log(glab(f"projects/:id/jobs/{job['id']}/trace", raw=True))
+    if not done:  # a partial trace must never be served later as the final log
+        path = path[:-4] + ".partial.log"
     # Logs can hold secrets a job printed: keep the cache private to the user.
     folder = os.path.dirname(path)
     os.makedirs(folder, mode=0o700, exist_ok=True)
@@ -319,6 +325,8 @@ def pipe_summary(pid, show_all=False):
     )
     if p is None:
         sys.exit(f"glab-lean: pipeline {pid} not found")
+    if jobs is None:
+        print("glab-lean: jobs unavailable (API error); rerun to see them", file=sys.stderr)
     jobs, bridges = jobs or [], bridges or []
     print(f"pipeline {p['id']} {p['status']}  ref {p['ref']}  sha {p['sha'][:8]}  {dur(p.get('duration'))}"
           f"  source {p.get('source')}\n{p['web_url']}")
@@ -360,53 +368,63 @@ def cmd_pipes(a):
 # ---------------------------------------------------------------- waiting
 
 def cmd_wait(a):
-    deadline = time.time() + a.timeout
-    until = set(a.until.split(",")) if a.until else None
-    last = None
+    until = set(a.until.split(",")) if a.until else set()
+    if a.kind == "mr":
+        iid = resolve_mr(a.id)
+
+        def poll():
+            m = glab(f"projects/:id/merge_requests/{iid}")
+            if until:
+                hit = m["state"] in until or m.get("detailed_merge_status") in until
+                return m["state"], hit or m["state"] in ("merged", "closed"), hit, m
+            hp = m.get("head_pipeline") or {}
+            st = hp.get("status", "no-pipeline")
+            return st, st in DONE_PIPE and on_head(hp, m), st in ("success", "manual"), m
+    else:
+        url = f"projects/:id/{'jobs' if a.kind == 'job' else 'pipelines'}/{int(a.id)}"
+        final = DONE_JOB if a.kind == "job" else DONE_PIPE
+
+        def poll():
+            o = glab(url)
+            st = o["status"]
+            hit = st in until if until else st in ("success", "manual")
+            return st, st in until or st in final, hit, o
+
+    deadline, polls, errors = time.time() + a.timeout, 0, 0
     while True:
+        polls += 1
         try:
-            if a.kind == "job":
-                j = job_meta(a.id)
-                st, done = j["status"], (j["status"] in until if until else j["status"] in DONE_JOB)
-            elif a.kind == "pipe":
-                p = glab(f"projects/:id/pipelines/{a.id}")
-                st, done = p["status"], (p["status"] in until if until else p["status"] in DONE_PIPE)
-            else:
-                m = glab(f"projects/:id/merge_requests/{resolve_mr(a.id)}")
-                hp = m.get("head_pipeline") or {}
-                if until:
-                    st = m["state"]
-                    done = st in until or m.get("detailed_merge_status") in until
-                else:
-                    st = hp.get("status", "no-pipeline")
-                    done = st in DONE_PIPE and on_head(hp, m)
-            last = st
+            st, done, ok, obj = poll()
+            errors = 0
         except ApiError as e:
-            last = f"api-error: {e}"
-            done = False
+            errors += 1
+            if polls == 1 or errors >= 5:  # a bad ID or repo won't fix itself
+                sys.exit(f"glab-lean: {e}")
+            st, done = f"api-error: {e}", False
         if done:
             break
         if time.time() > deadline:
-            print(f"timeout after {a.timeout}s; last status: {last}")
+            print(f"timeout after {a.timeout}s; last status: {st}")
             sys.exit(124)
         time.sleep(a.every)
     if a.kind == "job":
-        cmd_job(argparse.Namespace(id=a.id, sections=False, section=None, full=False, grep=None,
+        cmd_job(argparse.Namespace(id=int(a.id), sections=False, section=None, full=False, grep=None,
                                    tail=None, head=None, max=30, context=0))
     elif a.kind == "pipe":
-        pipe_summary(a.id)
-    elif until:
-        print(f"!{m['iid']} {m['state']} merge_status {m.get('detailed_merge_status')}")
+        pipe_summary(int(a.id))
+    elif until or not (obj.get("head_pipeline") or {}).get("id"):
+        print(f"!{obj['iid']} {obj['state']} merge_status {obj.get('detailed_merge_status')}")
     else:
-        pipe_summary(hp["id"])
-    sys.exit(0 if last in ("success", "merged", "manual") or until else 1)
+        pipe_summary(obj["head_pipeline"]["id"])
+    sys.exit(0 if ok else 1)
 
 
 # ---------------------------------------------------------------- merge requests
 
 def diff_stat(d):
-    add = sum(1 for l in d.get("diff", "").splitlines() if l.startswith("+") and not l.startswith("+++"))
-    rem = sum(1 for l in d.get("diff", "").splitlines() if l.startswith("-") and not l.startswith("---"))
+    lines = d.get("diff", "").splitlines()
+    add = sum(1 for l in lines if l.startswith("+"))
+    rem = sum(1 for l in lines if l.startswith("-"))
     tag = " (new)" if d.get("new_file") else " (deleted)" if d.get("deleted_file") else \
         f" (from {d['old_path']})" if d.get("renamed_file") else ""
     return add, rem, f"{d['new_path']}{tag}"
@@ -420,8 +438,16 @@ def get_diffs(iid):
 
 
 def on_head(hp, m):
-    # Merged-results pipelines run on a merge commit, so their sha never equals the MR head.
-    return hp.get("sha") == m["sha"] or str(hp.get("ref", "")).startswith("refs/merge-requests/")
+    """True when the pipeline ran on the MR's current head commit."""
+    if hp.get("sha") == m["sha"]:
+        return True
+    # Merged-results and merge-train pipelines run on a merge commit whose parent is the head.
+    if re.match(r"refs/merge-requests/\d+/(merge|train)$", str(hp.get("ref", ""))):
+        try:
+            return m["sha"] in glab(f"projects/:id/repository/commits/{hp['sha']}").get("parent_ids", [])
+        except ApiError:
+            return True  # can't tell; don't claim it's stale
+    return False
 
 
 def unresolved(discs):
@@ -444,7 +470,8 @@ def cmd_mr(a):
           f"  updated {m['updated_at'][:16]}\n{m['web_url']}")
     blockers = []
     ms = m.get("detailed_merge_status") or m.get("merge_status")
-    if m["state"] == "opened" and ms != "mergeable":
+    pending = ms in ("checking", "unchecked", "cannot_be_merged_recheck", "approvals_syncing", "preparing")
+    if m["state"] == "opened" and ms not in ("mergeable", "can_be_merged") and not pending:
         blockers.append(ms)
     if m.get("has_conflicts"):
         blockers.append("conflicts")
@@ -462,7 +489,8 @@ def cmd_mr(a):
     total = sum(1 for d in (discs or []) if any(n.get("resolvable") for n in d["notes"]))
     print(f"threads: {len(ur)} unresolved of {total}")
     if m["state"] == "opened":
-        print("ready to merge" if not blockers else "blocked: " + ", ".join(blockers))
+        print("blocked: " + ", ".join(blockers) if blockers else
+              f"merge status pending ({ms}); check again shortly" if pending else "ready to merge")
     elif m["state"] == "merged":
         print(f"merged {str(m.get('merged_at'))[:16]}  sha {(m.get('squash_commit_sha') or m.get('merge_commit_sha') or '')[:8]}")
     meta = []
@@ -490,6 +518,9 @@ def cmd_mr(a):
 
 
 def cmd_diff(a):
+    if a.iid and not re.fullmatch(r"!?\d+", a.iid):  # `diff src/app.py`: the first arg is a path
+        a.paths.insert(0, a.iid)
+        a.iid = None
     iid = resolve_mr(a.iid)
     diffs = get_diffs(iid)
     if not a.paths:
@@ -536,6 +567,8 @@ def cmd_mrs(a):
     p = {"state": a.state, "per_page": a.limit, "order_by": "updated_at"}
     if a.mine:
         p["scope"] = "created_by_me"
+    elif a.everywhere:
+        p["scope"] = "all"
     if a.review:
         p["reviewer_username"] = a.review
     if a.source:
@@ -554,7 +587,8 @@ def cmd_mrs(a):
 
 TF_HDR = re.compile(r"^\s*# (.+?) (will be created|will be destroyed|will be updated in-place|must be replaced|"
                     r"will be replaced.*|is tainted.*|will be read during apply|has moved to .+|"
-                    r"will no longer be managed.*|will be imported.*|has changed|has been deleted)"
+                    r"will no longer be managed.*|will be removed from the .* state.*|will be imported.*|"
+                    r"has changed|has been deleted)"
                     r"(\s*\(.*\))?$")
 SYM = {"will be created": "+", "will be destroyed": "-", "will be updated in-place": "~",
        "must be replaced": "-/+", "will be read during apply": "<=", "has changed": "drift~",
@@ -572,8 +606,9 @@ def tf_parse(lines):
         if m:
             what = m.group(2)
             sym = SYM.get(what) or ("->" if what.startswith("has moved") else
-                                    "-/+" if "replace" in what or "tainted" in what else what)
-            note = f"  {what}" if sym == what or what.startswith("has moved") else ""
+                                    "-/+" if "replace" in what or "tainted" in what else
+                                    "import" if "imported" in what else "forget")
+            note = f"  {what}" if sym == "->" else ""
             res.append((i, sym, m.group(1) + note))
         elif TF_TOTAL.match(l):
             totals.append(l.strip())
@@ -595,7 +630,7 @@ def tf_block(lines, start, full):
         if TF_HDR.match(l) or TF_END.match(l.strip()):
             break
         s = l.strip()
-        if full or (s[:1] in "+-~" or s.startswith("<=") or "forces replacement" in s):
+        if full or (s and s[0] in "+-~") or s.startswith("<=") or "forces replacement" in s:
             out.append(l)
     return out
 
@@ -787,7 +822,7 @@ def main():
     p.set_defaults(fn=cmd_mr)
 
     p = sp.add_parser("diff", help="MR diffstat, or diffs of files matching PATHS")
-    p.add_argument("iid", nargs="?", type=mr_iid)
+    p.add_argument("iid", nargs="?", help="MR IID (or the first path)")
     p.add_argument("paths", nargs="*")
     p.add_argument("--max", type=int, default=300, help="max lines per file")
     p.set_defaults(fn=cmd_diff)
@@ -916,8 +951,9 @@ def main():
         a.fn(a)
     except ApiError as e:
         sys.exit(sanitize(f"glab-lean: {e}"))
-    except BrokenPipeError:
-        pass
+    except BrokenPipeError:  # e.g. `| head`: exit quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
 
 
 if __name__ == "__main__":

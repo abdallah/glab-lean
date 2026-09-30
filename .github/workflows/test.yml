@@ -4,13 +4,19 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.8", "3.13"]
+        include:
+          - python: "3.8"
+            os: ubuntu-22.04  # the last runner image that ships 3.8
+          - python: "3.13"
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python }}
       - run: python -m unittest discover -s tests -v

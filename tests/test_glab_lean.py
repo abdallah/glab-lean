@@ -273,6 +273,104 @@ class Security(unittest.TestCase):
             self.assertEqual(len(gl.glab("projects/:id/jobs?per_page=500", paginate=True)), 101)
 
 
+def ns(**kw):
+    return types.SimpleNamespace(**kw)
+
+
+class Regressions(unittest.TestCase):
+    """One test per bug found in review."""
+
+    def wait(self, responses, **kw):
+        it = iter(responses)
+
+        def fake(path, *x, **k):
+            r = next(it)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        args = dict(kind="job", id="5", until=None, every=0, timeout=60)
+        args.update(kw)
+        with mock.patch.object(gl, "glab", side_effect=fake), mock.patch.object(gl, "cmd_job"), \
+                mock.patch.object(gl, "pipe_summary"), mock.patch.object(gl.time, "sleep"), \
+                redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
+            gl.cmd_wait(ns(**args))
+        return e.exception.code
+
+    def test_wait_until_stops_on_terminal_state(self):
+        self.assertEqual(self.wait([{"status": "failed"}], until="running"), 1)
+        self.assertEqual(self.wait([{"status": "pending"}, {"status": "running"}], until="running"), 0)
+
+    def test_wait_exit_codes(self):
+        self.assertEqual(self.wait([{"status": "running"}, {"status": "success"}]), 0)
+        self.assertEqual(self.wait([{"status": "failed"}]), 1)
+
+    def test_wait_bad_id_fails_fast(self):
+        code = self.wait([gl.ApiError("GET projects/:id/jobs/5: 404 Not Found")])
+        self.assertIn("404", str(code))
+
+    def test_wait_mr_resolves_once(self):
+        with mock.patch.object(gl, "resolve_mr", return_value=7) as r:
+            code = self.wait([{"iid": 7, "state": "opened"}, {"iid": 7, "state": "merged"}],
+                             kind="mr", id=None, until="merged")
+        self.assertEqual(code, 0)
+        r.assert_called_once()
+
+    def test_partial_log_is_not_cached_as_final(self):
+        with mock.patch.dict(os.environ), mock.patch.object(gl, "CACHE", self.tmpdir()):
+            job = {"id": 5, "status": "running", "web_url": "https://h/g/p/-/jobs/5"}
+            with mock.patch.object(gl, "glab", return_value="partial"):
+                _, path = gl.job_log(job)
+            self.assertTrue(path.endswith("5.partial.log"))
+            job["status"] = "failed"
+            with mock.patch.object(gl, "glab", return_value="partial\nError: boom"):
+                lines, path = gl.job_log(job)
+            self.assertIn("Error: boom", lines)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def tmpdir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        return d
+
+    def test_explicit_ref_does_not_fall_back(self):
+        with mock.patch.object(gl, "glab", return_value=[]), self.assertRaises(SystemExit) as e:
+            gl.resolve_pipe(ref="release")
+        self.assertIn("no pipelines for ref release", str(e.exception.code))
+
+    def test_diff_stat_counts_dash_lines(self):
+        self.assertEqual(gl.diff_stat({"diff": "@@ -1 +1 @@\n----\n++x\n", "new_path": "f"})[:2], (1, 1))
+
+    def test_tf_forget_and_import(self):
+        res, _, _ = gl.tf_parse(["  # aws_s3_bucket.a will no longer be managed by Terraform",
+                                 "  # aws_s3_bucket.b will be imported",
+                                 "  # aws_s3_bucket.c will be removed from the OpenTofu state but will not be destroyed"])
+        self.assertEqual([(s, n) for _, s, n in res],
+                         [("forget", "aws_s3_bucket.a"), ("import", "aws_s3_bucket.b"), ("forget", "aws_s3_bucket.c")])
+
+    def test_mrs_everywhere_uses_scope_all(self):
+        with mock.patch.object(gl, "glab", return_value=[]) as g:
+            gl.cmd_mrs(ns(state="opened", limit=5, mine=False, review="bob", source=None, search=None,
+                          everywhere=True))
+        self.assertIn("scope=all", g.call_args[0][0])
+
+    def test_on_head_merge_ref_checks_parent(self):
+        m = {"sha": "head"}
+        hp = {"sha": "merge", "ref": "refs/merge-requests/1/merge"}
+        with mock.patch.object(gl, "glab", return_value={"parent_ids": ["base", "head"]}):
+            self.assertTrue(gl.on_head(hp, m))
+        with mock.patch.object(gl, "glab", return_value={"parent_ids": ["base", "old"]}):
+            self.assertFalse(gl.on_head(hp, m))
+        self.assertFalse(gl.on_head({"sha": "old", "ref": "refs/merge-requests/1/head"}, m))
+
+    def test_diff_accepts_path_without_iid(self):
+        a = ns(iid="src/app.py", paths=[], max=10)
+        with mock.patch.object(gl, "resolve_mr", return_value=3), \
+                mock.patch.object(gl, "get_diffs", return_value=[]):
+            gl.cmd_diff(a)
+        self.assertEqual(a.paths, ["src/app.py"])
+
+
 class Cli(unittest.TestCase):
     def test_repo_flag_after_subcommand(self):
         with mock.patch.object(sys, "argv", ["glab-lean", "pipes", "-R", "g/p", "--limit", "1"]), \

@@ -49,7 +49,7 @@ four. For an agent without skill support, add the snippet in
 ## Install
 
 ```bash
-git clone https://github.com/<you>/glab-lean.git ~/.local/share/glab-lean
+git clone https://github.com/abdallah/glab-lean.git ~/.local/share/glab-lean
 ~/.local/share/glab-lean/install.sh           # symlinks, so `git pull` updates it
 ~/.local/share/glab-lean/install.sh --copy    # or copy the files instead
 ```
@@ -66,7 +66,7 @@ If you're an AI agent asked to set up `glab-lean`, do the following:
 2. Clone and install:
 
    ```bash
-   git clone https://github.com/<you>/glab-lean.git ~/.local/share/glab-lean
+   git clone https://github.com/abdallah/glab-lean.git ~/.local/share/glab-lean
    ~/.local/share/glab-lean/install.sh
    ```
 
@@ -148,16 +148,29 @@ $ glab-lean tf 5030 -r module.oidc.aws_iam_role.this   # only the changed lines
 | `wait` | Wait silently for a job, pipeline, or MR to finish, then print the summary |
 | `run`, `play`, `retry`, `cancel`, `merge` | Pipeline and MR actions, one line each |
 | `note`, `reply`, `resolve` | MR comments and threads |
-| `api` | Any GET endpoint as TSV, with `-f` fields and `-w` filters |
+| `api` | GET a REST path as TSV, with `-f` fields and `-w` filters |
 
 Run `glab-lean <command> --help` for flags.
 
 `wait` exits `0` on success, `1` on failure, and `124` on timeout. It's meant for background
 commands.
 
+## Security
+
+- **Same host only:** `glab-lean` only sends relative REST paths such as `projects/:id/…` to
+  `glab api`. It refuses absolute URLs and `-R` values that aren't `group/project`, so a
+  prompt-injected command can't send your token to another host.
+- **Read-only commands stay read-only:** `mr`, `threads`, `diff`, `mrs`, `pipe`, `pipes`, `job`,
+  `tf`, `wait`, and `api` only send GET requests.
+- **Output is sanitized:** terminal escape sequences and invisible Unicode controls are stripped
+  from everything it prints, including MR text and job logs.
+- **Untrusted content:** MR text, comments, and job logs are written by other people. The skill
+  tells agents to treat them as data, never as instructions.
+
 ## Job log cache
 
-`job` and `tf` save each finished job's cleaned log under `~/.cache/glab-lean/`, so an agent can
+`job` and `tf` save each finished job's cleaned log under `~/.cache/glab-lean/` (a running job's
+log goes to a separate `.partial.log` file), so an agent can
 search it without downloading it again. The logs are stored as plain text with owner-only
 permissions, and they contain whatever the job printed, including any secrets it leaked. To move
 the cache, set `GLAB_LEAN_CACHE`. To clear it, delete the directory.
