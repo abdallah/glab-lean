@@ -372,6 +372,20 @@ class Regressions(unittest.TestCase):
         self.assertEqual(a.paths, ["src/app.py"])
 
 
+class Excerpt(unittest.TestCase):
+    def test_repeated_lines_collapse_and_runner_noise_is_skipped(self):
+        lines = ["== get_sources", "Fetching changes with git depth set to 20...", "== step_script",
+                 'Executing "step_script" stage of the job script', "Using docker image sha256:abc"]
+        for loc in ("de", "fr", "ja"):
+            lines += [f"{loc} missing app.title", f"{loc} missing app.body"]
+        lines += ["check: FAIL — 6 findings", "== upload_artifacts_on_failure", "Uploading artifacts"]
+        job = {"id": 9, "status": "failed", "web_url": "https://h/g/p/-/jobs/9"}
+        with mock.patch.object(gl, "job_log", return_value=(lines, "/tmp/x/9.log")):
+            out, path = gl.error_excerpt(job)
+        self.assertEqual(out, ["ja missing app.title  (×3)", "ja missing app.body  (×3)", "check: FAIL — 6 findings"])
+        self.assertEqual(path, "/tmp/x/9.log")
+
+
 class Cli(unittest.TestCase):
     def test_repo_flag_after_subcommand(self):
         with mock.patch.object(sys, "argv", ["glab-lean", "pipes", "-R", "g/p", "--limit", "1"]), \

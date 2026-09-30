@@ -5,6 +5,7 @@ Every command prints a short, fixed-shape summary. Full job logs are cached on
 disk so follow-up searches use grep instead of another API call.
 """
 import argparse
+import collections
 import concurrent.futures as cf
 import json
 import os
@@ -317,32 +318,37 @@ def error_lines(lines, end):
     return [i for i, l in enumerate(lines[:end]) if ERR.search(l) and not NOISE.search(l) and not l.startswith("$ ")]
 
 
-def error_excerpt(job, n=5):
-    """The last error-like lines of a job's log, topped up with its final lines, plus the log path."""
+RUNNER = re.compile(r"(Executing \"step_script\"|Using (effective pull policy|docker image|Docker executor)|"
+                    r"Pulling docker image|Running on |Preparing (the|environment)|Skipping Git|Fetching changes|"
+                    r"Checking out |Created fresh repository|Getting source from|Resolving secrets|Waiting for pod)")
+
+
+def error_excerpt(job, n=10):
+    """Why a job failed, in a few lines: its last error-like lines plus the distinct messages at the
+    end of its log. Lines that differ only in their first word (one per locale, host, file, …) are
+    shown once with a count. Returns (lines, cached log path)."""
     try:
         lines, path = job_log(job)
     except ApiError:
         return [], None
     end = body_end(lines)
-    idx = error_lines(lines, end)[-n:]
-    tail = [i for i in range(end) if lines[i].strip() and not lines[i].startswith("$ ") and i not in idx]
-    tail = tail[-(n - len(idx)):] if len(idx) < n else []
-    idx = sorted(idx + tail)
-    return [cut(lines[i], 200) for i in idx], path.replace(os.path.expanduser("~"), "~", 1)
 
+    def shape(line):
+        return " ".join(line.split()[1:]) or line
 
-def show_hits(lines, hits, ctx, mx):
-    if len(hits) > mx:
-        print(f"({len(hits)} matches, showing last {mx}; raise --max or grep the log file)")
-        hits = hits[-mx:]
-    last = -2
-    for i in hits:
-        lo, hi = max(0, i - ctx), min(len(lines), i + ctx + 1)
-        if ctx and lo > last + 1:
-            print("--")
-        for k in range(max(lo, last + 1), hi):
-            print(f"{k + 1}: {cut(lines[k], 400)}")
-        last = hi - 1
+    start = next((i + 1 for i, l in enumerate(lines[:end]) if l == "== step_script"), 0)  # skip runner setup
+    window = [i for i in range(start, end) if lines[i].strip() and not lines[i].startswith(("$ ", "== "))
+              and not RUNNER.match(lines[i])][-40:]
+    counts = collections.Counter(shape(lines[i]) for i in window)
+    latest = {shape(lines[i]): i for i in window}  # last line of each shape
+    tail = sorted(latest.values())[-8:]
+    shapes = {shape(lines[i]) for i in tail}
+    errs = [i for i in error_lines(lines, end)[-5:] if i >= start and shape(lines[i]) not in shapes]
+    out = []
+    for i in sorted(errs + tail)[-n:]:
+        c = counts[shape(lines[i])] if i in tail else 1
+        out.append(cut(lines[i], 200) + (f"  (×{c})" if c > 1 else ""))
+    return out, path.replace(os.path.expanduser("~"), "~", 1)
 
 
 # ---------------------------------------------------------------- pipelines
