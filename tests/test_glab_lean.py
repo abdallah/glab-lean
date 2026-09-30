@@ -156,7 +156,8 @@ class Helpers(unittest.TestCase):
 
     def test_on_head(self):
         self.assertTrue(gl.on_head({"sha": "a"}, {"sha": "a"}))
-        self.assertTrue(gl.on_head({"sha": "m", "ref": "refs/merge-requests/1/merge"}, {"sha": "a"}))
+        with mock.patch.object(gl, "glab", return_value={"parent_ids": ["a"]}):
+            self.assertTrue(gl.on_head({"sha": "m", "ref": "refs/merge-requests/1/merge"}, {"sha": "a"}))
         self.assertFalse(gl.on_head({"sha": "b", "ref": "main"}, {"sha": "a"}))
 
     def test_kv(self):

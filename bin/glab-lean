@@ -37,6 +37,13 @@ def check_path(path):
         raise ApiError(f"refusing path {path!r}: pass a relative REST path such as projects/:id/pipelines")
 
 
+def run_glab(cmd, inp):
+    try:
+        return subprocess.run(cmd, input=inp, capture_output=True)
+    except FileNotFoundError:
+        sys.exit("glab-lean: glab not found; install it and run `glab auth login`")
+
+
 def glab(path, method="GET", body=None, raw=False, paginate=False):
     check_path(path)
     cmd = ["glab", "api"]
@@ -61,10 +68,10 @@ def glab(path, method="GET", body=None, raw=False, paginate=False):
         cmd += ["-H", "Content-Type: application/json", "--input", "-"]
         inp = json.dumps(body).encode()
     cmd.append(path)
-    p = subprocess.run(cmd, input=inp, capture_output=True)
+    p = run_glab(cmd, inp)
     if p.returncode != 0 and method == "GET":  # one retry: parallel glab calls fail now and then
         time.sleep(1)
-        p = subprocess.run(cmd, input=inp, capture_output=True)
+        p = run_glab(cmd, inp)
     if p.returncode != 0:
         msg = (p.stderr or p.stdout).decode(errors="replace").strip().splitlines()
         raise ApiError(f"{method} {path}: {msg[-1] if msg else 'failed'}")
