@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Measure what GitLab tool calls cost in Claude Code sessions, before and after glab-lean.
+
+Reads Claude Code transcripts (~/.claude/projects/**/*.jsonl), finds GitLab calls (glab-lean,
+raw glab, and GitLab MCP tools), and estimates what each one cost:
+
+  result tokens    the tool output, written to the prompt cache once       (weight 1.25)
+  carried tokens   that output re-read on every later API call in session   (weight 0.10)
+  command tokens   the command the model wrote, billed as output            (weight 5.00)
+
+Weights are Anthropic's price ratios relative to base input tokens, so the totals are
+"input-token equivalents" and compare fairly across models. Tokens are estimated as chars/4.
+
+  usage-report                          # before/after table, split at the first glab-lean call
+  usage-report --cutoff 2026-09-30T12:00
+  usage-report --snapshot               # also save extracted records to the state file
+  usage-report --json                   # machine-readable summary
+
+Snapshots keep the numbers after Claude Code deletes old transcripts (30 days by default).
+"""
+import argparse
+import collections
+import glob
+import json
+import os
+import re
+import socket
+import sys
+
+PROJECTS = os.path.expanduser("~/.claude/projects")
+STATE = os.path.expanduser(os.environ.get("GLAB_LEAN_STATE", "~/.local/state/glab-lean/usage.jsonl"))
+LEAN = re.compile(r"\b(glab-lean|glean)\b")
+GLAB = re.compile(r"(^|[\s;&|(`$])glab\s")
+POLL = re.compile(r"\b(sleep|until|watch)\b|\bwait\b")
+W_RESULT, W_CARRY, W_OUTPUT = 1.25, 0.10, 5.0
+CHARS_PER_TOKEN = 4
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return ""
+
+
+def classify(block):
+    name = block.get("name", "")
+    inp = block.get("input") or {}
+    if name.startswith("mcp__gitlab__"):
+        return "mcp", name[len("mcp__gitlab__"):], json.dumps(inp)
+    if name == "Skill" and str(inp.get("skill", "")).strip("/") in ("glab-lean", "glean"):
+        return "skill", "load", ""
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        if LEAN.search(cmd):
+            m = re.search(r"\b(?:glab-lean|glean)\s+(?:-R\s+\S+\s+)?(\w+)", cmd)
+            return "glab-lean", m.group(1) if m else "?", cmd
+        if GLAB.search(" " + cmd):
+            m = re.search(r"\bglab\s+(\w+)(?:\s+(\w+))?", cmd)
+            sub = " ".join(x for x in (m.groups() if m else ()) if x) or "?"
+            return "glab", sub, cmd
+    return None
+
+
+def scan_file(path, host):
+    """Yield call and session records for one transcript."""
+    uses, results, order = {}, {}, []
+    seen_msgs, usage = set(), collections.Counter()
+    sid = entry = start = None
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        sid = sid or d.get("sessionId")
+        entry = entry or d.get("entrypoint")
+        start = start or d.get("timestamp")
+        msg = d.get("message") or {}
+        if d.get("type") == "assistant" and msg.get("id") and msg["id"] not in seen_msgs:
+            seen_msgs.add(msg["id"])
+            order.append(("api", msg["id"]))
+            u = msg.get("usage") or {}
+            usage.update({"input": u.get("input_tokens", 0), "cache_write": u.get("cache_creation_input_tokens", 0),
+                          "cache_read": u.get("cache_read_input_tokens", 0), "output": u.get("output_tokens", 0)})
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use":
+                c = classify(b)
+                if c:
+                    uses[b["id"]] = (d.get("timestamp"), *c)
+                    order.append(("use", b["id"]))
+            elif b.get("type") == "tool_result" and b.get("tool_use_id") in uses:
+                results[b["tool_use_id"]] = len(text_of(b.get("content")))
+    if not sid:
+        return
+    api_total = sum(1 for k, _ in order if k == "api")
+    api_seen = 0
+    calls = 0
+    for kind, key in order:
+        if kind == "api":
+            api_seen += 1
+            continue
+        ts, cat, sub, cmd = uses[key]
+        calls += 1
+        yield {"k": "call", "id": key, "sid": sid, "host": host, "entry": entry, "ts": ts, "cat": cat,
+               "sub": sub, "res": results.get(key, 0), "cmd": len(cmd), "after": api_total - api_seen,
+               "poll": bool(cat in ("glab", "glab-lean") and POLL.search(cmd))}
+    yield {"k": "session", "id": f"s:{sid}:{os.path.basename(path)}", "sid": sid, "host": host, "entry": entry,
+           "ts": start, "api_calls": api_total, "gitlab_calls": calls, **usage}
+
+
+def load(args):
+    host = socket.gethostname()
+    recs = {}
+    if os.path.exists(STATE):
+        for line in open(STATE, encoding="utf-8"):
+            r = json.loads(line)
+            recs[r["id"]] = r
+    for path in glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True):
+        for r in scan_file(path, host):
+            recs[r["id"]] = r  # live transcripts win over older snapshots
+    return list(recs.values())
+
+
+def cost(c):
+    tok = c["res"] / CHARS_PER_TOKEN
+    return tok * W_RESULT + tok * c["after"] * W_CARRY + c["cmd"] / CHARS_PER_TOKEN * W_OUTPUT
+
+
+def summarize(calls, sessions):
+    gl_sessions = {c["sid"] for c in calls}
+    n = len(calls) or 1
+    by_cat = collections.Counter(c["cat"] for c in calls)
+    total = sum(cost(c) for c in calls)
+    return {
+        "sessions_with_gitlab": len(gl_sessions),
+        "gitlab_calls": len(calls),
+        "calls_by_kind": dict(by_cat),
+        "polling_calls": sum(c["poll"] for c in calls),
+        "avg_result_tokens": round(sum(c["res"] for c in calls) / CHARS_PER_TOKEN / n),
+        "avg_command_tokens": round(sum(c["cmd"] for c in calls) / CHARS_PER_TOKEN / n),
+        "avg_cost_per_call": round(total / n),
+        "calls_per_session": round(len(calls) / (len(gl_sessions) or 1), 1),
+        "cost_per_session": round(total / (len(gl_sessions) or 1)),
+        "total_cost": round(total),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cutoff", help="ISO time splitting before/after (default: first glab-lean call)")
+    ap.add_argument("--since", help="ignore calls before this ISO time")
+    ap.add_argument("--exclude", action="append", default=[], help="session ID to leave out (repeatable)")
+    ap.add_argument("--all-entrypoints", action="store_true", help="include `claude -p` and SDK sessions")
+    ap.add_argument("--snapshot", action="store_true", help=f"save records to {STATE}")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    recs = load(a)
+    if a.snapshot:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in sorted(recs, key=lambda r: r.get("ts") or ""):
+                f.write(json.dumps(r) + "\n")
+        os.replace(tmp, STATE)
+
+    def keep(r):
+        return (r["sid"] not in a.exclude and (a.all_entrypoints or r.get("entry") in (None, "cli"))
+                and (not a.since or (r.get("ts") or "") >= a.since))
+
+    calls = [r for r in recs if r["k"] == "call" and keep(r)]
+    sessions = [r for r in recs if r["k"] == "session" and keep(r)]
+    # Split at the first use on any session, including excluded ones: that's when it was installed.
+    lean = sorted(r["ts"] for r in recs if r["k"] == "call" and r["cat"] in ("glab-lean", "skill") and r.get("ts"))
+    cutoff = a.cutoff or (lean[0] if lean else "9999")
+    before = [c for c in calls if (c.get("ts") or "") < cutoff]
+    after = [c for c in calls if (c.get("ts") or "") >= cutoff]
+    out = {"cutoff": cutoff, "hosts": sorted({r["host"] for r in recs}),
+           "before": summarize(before, sessions), "after": summarize(after, sessions)}
+    days = collections.defaultdict(list)
+    for c in after:
+        days[(c.get("ts") or "")[:10]].append(c)
+    out["after_by_day"] = {d: summarize(cs, sessions) for d, cs in sorted(days.items())}
+
+    if a.json:
+        print(json.dumps(out, indent=2))
+        return
+    b, f = out["before"], out["after"]
+    print(f"hosts {', '.join(out['hosts'])}  cutoff {cutoff[:16]}  (cost = input-token equivalents)")
+    rows = [("sessions with GitLab calls", "sessions_with_gitlab"), ("GitLab calls", "gitlab_calls"),
+            ("polling calls", "polling_calls"), ("avg result tokens / call", "avg_result_tokens"),
+            ("avg command tokens / call", "avg_command_tokens"), ("avg cost / call", "avg_cost_per_call"),
+            ("GitLab calls / session", "calls_per_session"), ("GitLab cost / session", "cost_per_session")]
+    print(f"{'':30}{'before':>12}{'after':>12}{'change':>10}")
+    for label, key in rows:
+        x, y = b[key], f[key]
+        ch = f"{(y - x) / x * 100:+.0f}%" if x and f["gitlab_calls"] else ""
+        print(f"{label:30}{x:>12}{y:>12}{ch:>10}")
+    print(f"calls by kind  before {b['calls_by_kind']}  after {f['calls_by_kind']}")
+    if f["gitlab_calls"] < 30:
+        print(f"note: only {f['gitlab_calls']} calls after the cutoff; treat the change column as rough")
+
+
+if __name__ == "__main__":
+    main()

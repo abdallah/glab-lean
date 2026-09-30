@@ -175,6 +175,17 @@ search it without downloading it again. The logs are stored as plain text with o
 permissions, and they contain whatever the job printed, including any secrets it leaked. To move
 the cache, set `GLAB_LEAN_CACHE`. To clear it, delete the directory.
 
+## Measuring savings
+
+`scripts/usage-report` reads your Claude Code transcripts and compares GitLab tool calls before
+and after the first `glab-lean` call: calls per session, tokens per call, polling calls, and an
+estimated cost in input-token equivalents. Run it with `--snapshot` (for example, from a nightly
+cron job) to keep the records after Claude Code deletes old transcripts.
+
+```bash
+~/.local/share/glab-lean/scripts/usage-report
+```
+
 ## Development
 
 ```bash
