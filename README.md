@@ -30,16 +30,52 @@ Typical output sizes, measured on real projects:
 - Python 3.8 or later. It uses only the standard library.
 - `glab`, logged in with `glab auth login`.
 
+## Supported agents
+
+The CLI works with any agent that can run shell commands. The skill uses the open
+[Agent Skills](https://agentskills.io) format, so agents that support skills load it on their own:
+
+| Agent | User-level skills directory |
+|---|---|
+| Claude Code | `~/.claude/skills/` |
+| Codex | `~/.agents/skills/` |
+| Gemini CLI | `~/.agents/skills/` (or `~/.gemini/skills/`) |
+| OpenCode | `~/.agents/skills/`, `~/.claude/skills/`, or `~/.config/opencode/skills/` |
+
+`install.sh` installs the skill into `~/.claude/skills/` and `~/.agents/skills/`, which covers all
+four. For an agent without skill support, add the snippet in
+[Other agents](#other-agents) to its instructions file.
+
 ## Install
 
 ```bash
-git clone https://github.com/<you>/glab-lean.git
-cd glab-lean
-./install.sh           # symlinks into ~/.local/bin and ~/.claude/skills
-./install.sh --copy    # or copy the files instead
+git clone https://github.com/<you>/glab-lean.git ~/.local/share/glab-lean
+~/.local/share/glab-lean/install.sh           # symlinks, so `git pull` updates it
+~/.local/share/glab-lean/install.sh --copy    # or copy the files instead
 ```
 
-To install somewhere else, set `BIN_DIR` and `SKILLS_DIR`.
+To install somewhere else, set `BIN_DIR` and `SKILLS_DIRS` (a space-separated list).
+
+### Setup steps for AI agents
+
+If you're an AI agent asked to set up `glab-lean`, do the following:
+
+1. Check the prerequisites: `python3 --version` must report 3.8 or later, and `glab auth status`
+   must show a logged-in host. If `glab` isn't logged in, stop and ask the user to run
+   `glab auth login`, because it's interactive.
+2. Clone and install:
+
+   ```bash
+   git clone https://github.com/<you>/glab-lean.git ~/.local/share/glab-lean
+   ~/.local/share/glab-lean/install.sh
+   ```
+
+3. Confirm that `glab-lean --help` runs. If it's not found, `~/.local/bin` isn't on `PATH`; tell
+   the user rather than editing their shell profile.
+4. From inside a GitLab repo, run `glab-lean pipes --limit 1` to confirm API access.
+5. Optional: offer to add the read-only allow rules below. Don't change the user's agent settings
+   without asking.
+6. The skill loads in new sessions. Tell the user to restart any running agent sessions.
 
 ### Let Claude Code run it without prompts
 
@@ -54,7 +90,23 @@ To let Claude Code run the read-only commands without asking, add these rules to
 ```
 
 Leave `run`, `play`, `retry`, `cancel`, `merge`, `note`, `reply`, and `resolve` off the list. They
-change state in GitLab.
+change state in GitLab. Other agents have their own approval settings; allow the same read-only
+subcommands there.
+
+### Other agents
+
+For an agent that doesn't support skills, add this to its instructions file, such as `AGENTS.md`
+or `GEMINI.md`:
+
+```markdown
+## GitLab
+
+Use the `glab-lean` CLI for GitLab reads and CI before `glab api` or a GitLab MCP server:
+`glab-lean mr`, `threads`, `diff`, `pipe`, `job ID`, `tf JOB`, and `api PATH -f fields`.
+Run `glab-lean --help` for the full list. Wait on CI with `glab-lean wait job|pipe|mr ID` as a
+background command instead of sleep loops. For job logs, search the cached log file it prints
+instead of fetching the trace again.
+```
 
 ## Usage
 

@@ -1,5 +1,7 @@
 ---
 name: glab-lean
+license: MIT
+compatibility: Needs python3 3.8+ and the glab CLI logged in to a GitLab host.
 description: Token-lean GitLab access through the `glab-lean` CLI. Use for ANY GitLab read or CI task before reaching for `glab api`, `glab mr view`, `glab ci trace`, or a GitLab MCP server — checking an MR's merge readiness, reading review threads, diffs, pipeline status, failed job logs, Terraform/OpenTofu plan output, waiting for a pipeline/job/MR to finish, running or retrying pipelines and manual jobs, merging, and replying to threads. Also use instead of writing jq/python over GitLab API JSON.
 ---
 
