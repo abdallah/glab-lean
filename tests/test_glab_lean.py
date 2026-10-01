@@ -367,7 +367,9 @@ class Regressions(unittest.TestCase):
     def test_diff_accepts_path_without_iid(self):
         a = ns(iid="src/app.py", paths=[], max=10)
         with mock.patch.object(gl, "resolve_mr", return_value=3), \
-                mock.patch.object(gl, "get_diffs", return_value=[]):
+                mock.patch.object(gl, "get_diffs", return_value=[{"old_path": "src/app.py", "new_path": "src/app.py",
+                                                                  "diff": "+x"}]), \
+                redirect_stdout(io.StringIO()):
             gl.cmd_diff(a)
         self.assertEqual(a.paths, ["src/app.py"])
 
@@ -479,28 +481,31 @@ class SecondReview(unittest.TestCase):
     def test_cache_drops_partial_and_old_logs(self):
         d = Regressions.tmpdir(self)
         with mock.patch.object(gl, "CACHE", d):
+            os.makedirs(os.path.join(d, "h_g_p"))
+            old, mine = os.path.join(d, "h_g_p", "4.log"), os.path.join(d, "h_g_p", "server.log")
+            for f in (old, mine):
+                open(f, "w").close()
+                os.utime(f, (0, 0))
             job = {"id": 5, "status": "running", "web_url": "https://h/g/p/-/jobs/5"}
             with mock.patch.object(gl, "glab", return_value="partial"):
                 _, partial = gl.job_log(job)
-            old = os.path.join(os.path.dirname(partial), "4.log")
-            open(old, "w").close()
-            os.utime(old, (0, 0))
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(os.path.exists(mine))  # not a glab-lean file: never pruned
             job["status"] = "success"
             with mock.patch.object(gl, "glab", return_value="done"):
                 gl.job_log(job)
             self.assertFalse(os.path.exists(partial))
-            self.assertFalse(os.path.exists(old))
 
     def test_pipe_prefers_mr_head_pipeline(self):
         routes = {"merge_requests?": [{"iid": 7}], "merge_requests/7": {"head_pipeline": {"id": 2}},
                   "pipelines?": [{"id": 1}]}
         with mock.patch.object(gl, "branch", return_value="f"), \
                 mock.patch.object(gl, "glab", side_effect=by_path(routes)):
-            self.assertEqual(gl.resolve_pipe(), 2)
+            self.assertEqual(gl.resolve_pipe(), (2, ":id"))
         routes["merge_requests?"] = []
         with mock.patch.object(gl, "branch", return_value="f"), \
                 mock.patch.object(gl, "glab", side_effect=by_path(routes)):
-            self.assertEqual(gl.resolve_pipe(), 1)
+            self.assertEqual(gl.resolve_pipe(), (1, ":id"))
 
     def test_repo_goes_in_the_path_not_to_glab_r(self):
         run, calls = fake_run([{"id": 1}])
@@ -535,6 +540,263 @@ class JobCommand(unittest.TestCase):
     def test_default_shows_error_lines_of_failed_job(self):
         out = self.run_job()
         self.assertIn("-- error-like lines (1) --\n3: Error: first", out)
+
+
+class FullReview(unittest.TestCase):
+    """One test per finding in the full-file review."""
+
+    def capture(self, fn, *args, **kw):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            fn(*args, **kw)
+        return out.getvalue()
+
+    def tmpdir(self):
+        return Regressions.tmpdir(self)
+
+    PIPE = {"id": 1, "status": "failed", "ref": "f", "sha": "abcdef12", "web_url": "u"}
+
+    def job(self, i, name="unit", status="failed", **kw):
+        return dict({"id": i, "name": name, "stage": "test", "status": status,
+                     "web_url": f"https://h/g/p/-/jobs/{i}"}, **kw)
+
+    # 1: cache I/O errors
+    def test_unwritable_cache_still_shows_pipe(self):
+        d = self.tmpdir()
+        os.chmod(d, 0o500)
+        self.addCleanup(os.chmod, d, 0o700)
+        routes = {"/jobs/9/trace": "Error: boom\nmore", "/jobs": [self.job(9)], "/bridges": [],
+                  "pipelines/1": self.PIPE}
+        with mock.patch.object(gl, "CACHE", os.path.join(d, "cache")), \
+                mock.patch.object(gl, "glab", side_effect=by_path(routes)):
+            out = self.capture(gl.pipe_summary, 1)
+            lines, path = gl.job_log(self.job(9))
+        self.assertIn("9  test/unit  failed", out)
+        self.assertIn("| Error: boom", out)
+        self.assertIsNone(path)
+        self.assertEqual(lines, ["Error: boom", "more"])
+
+    # 2: section markers and the runner's trailing sections
+    def test_sections_and_body_end(self):
+        lines = ["== get_sources", "fetch", "== step_script", "$ make", "== docker_cleanup", "removed",
+                 "== cleanup: removing stale fixtures", "== 2026 CreateUsers: migrating",
+                 "FAILED tests/test_api.py::test_login", "== upload_artifacts_on_failure",
+                 "ERROR: No files to upload", "== cleanup_file_variables", "ERROR: Job failed: exit code 1"]
+        end = gl.body_end(lines)
+        self.assertEqual(lines[end], "== upload_artifacts_on_failure")
+        self.assertIn(8, gl.error_lines(lines, end))
+        step = [s for s in gl.sections(lines) if s[0] == "step_script"][0]
+        self.assertEqual(lines[step[2]], "== upload_artifacts_on_failure")  # nested section doesn't end it
+        self.assertEqual([s[0] for s in gl.sections(lines)].count("cleanup:"), 0)
+        upload = lines[:9] + ["== upload_artifacts_on_success",
+                              "ERROR: Uploading artifacts as \"archive\" to coordinator... too large archive"]
+        self.assertEqual(gl.body_end(upload), len(upload))
+
+    # 3: wait mr after a push
+    def wait_mr(self, responses, local="new", upstream="new", grace=100):
+        with mock.patch.object(gl, "resolve_mr", return_value=7), mock.patch.object(gl, "NO_PIPE_GRACE", grace), \
+                mock.patch.object(gl, "git", side_effect=lambda *a: {("rev-parse", "HEAD"): local,
+                                                                     ("rev-parse", "@{u}"): upstream}.get(a, "f")):
+            return Regressions.wait(self, responses, kind="mr", id=None)
+
+    def mr(self, sha, hp=None, state="opened"):
+        return {"iid": 7, "state": state, "sha": sha, "source_branch": "f", "head_pipeline": hp}
+
+    def test_wait_mr_ignores_pipeline_from_before_push(self):
+        old = self.mr("old", {"id": 1, "status": "success", "sha": "old"})
+        new = self.mr("new", {"id": 2, "status": "failed", "sha": "new"})
+        self.assertEqual(self.wait_mr([old, new]), 1)  # the old success isn't the answer
+
+    def test_wait_mr_unpushed_fails_fast(self):
+        old = self.mr("old", {"id": 1, "status": "success", "sha": "old"})
+        self.assertEqual(self.wait_mr([old], upstream="old"), 1)
+
+    def test_wait_mr_stale_pipeline_gives_up_and_merged_stops(self):
+        stale = self.mr("new", {"id": 1, "status": "success", "sha": "old", "ref": "f"})
+        self.assertEqual(self.wait_mr([stale], grace=0), 1)
+        self.assertEqual(self.wait_mr([self.mr("x", state="merged")]), 0)
+        self.assertEqual(self.wait_mr([self.mr("x", state="closed")]), 1)
+
+    # 4 and 14: no-ID pipeline resolution
+    def test_resolve_pipe_surfaces_api_errors(self):
+        with mock.patch.object(gl, "branch", return_value="f"), \
+                mock.patch.object(gl, "glab", side_effect=gl.ApiError("GET x: 401 Unauthorized")), \
+                self.assertRaises(gl.ApiError):
+            gl.resolve_pipe()
+
+    def test_fork_mrs_are_skipped_and_fork_pipelines_use_their_project(self):
+        routes = {"merge_requests?": [{"iid": 8, "project_id": 1, "source_project_id": 99}],
+                  "pipelines?": [{"id": 100}]}
+        with mock.patch.object(gl, "branch", return_value="main"), \
+                mock.patch.object(gl, "glab", side_effect=by_path(routes)):
+            self.assertEqual(gl.resolve_pipe(), (100, ":id"))
+        self.assertEqual(gl.mr_pipeline({"head_pipeline": {"id": 500, "project_id": 99}}), (500, "99"))
+        with mock.patch.object(gl, "CACHE", self.tmpdir()), mock.patch.object(gl, "glab", return_value="x") as g:
+            gl.job_log(self.job(3, pipeline={"id": 500, "project_id": 99}))
+        self.assertEqual(g.call_args[0][0], "projects/99/jobs/3/trace")
+
+    # 5: error-line filters
+    def test_error_filters(self):
+        real = ["===== 10 failed, 45 passed =====", "Tests: 20 failed",
+                "FAILED tests/test_api.py::test_error_handling - AssertionError",
+                "PHP Fatal error: oops in /var/www/app/error_handler.php", "npm ERR! code 1 failed"]
+        noise = ["# fail 0", " 0 fail", "0 failed, 3 passed", "failed=0", "Errors: 0", "export ERROR_LEVEL=2",
+                 "curl --fail https://x"]
+        self.assertEqual(gl.error_lines(real + noise, len(real + noise)), list(range(len(real))))
+
+    # 6: the first error survives teardown noise
+    def test_excerpt_keeps_root_cause(self):
+        lines = ["== step_script", "src/a.c:10:5: error: 'foo' undeclared", "FAILED test_login",
+                 "FAILED test_logout", "2 failed, 5 passed"] + [f"Container c{i} Removed" for i in range(8)] + \
+                ["== after_script", "Running after_script", "Network n Removed"]
+        with mock.patch.object(gl, "job_log", return_value=(lines, "/tmp/x.log")):
+            out, _ = gl.error_excerpt(self.job(1), n=6)
+        self.assertEqual(out[0], "src/a.c:10:5: error: 'foo' undeclared")
+        self.assertNotIn("Network n Removed", out)
+
+    def test_excerpt_skips_box_drawing_lines(self):
+        lines = ["== step_script", "│ Error: Invalid index", "│", "│ on main.tf line 3", "│", "╵"]
+        with mock.patch.object(gl, "job_log", return_value=(lines, "/tmp/x.log")):
+            out, _ = gl.error_excerpt(self.job(1))
+        self.assertFalse([l for l in out if "×" in l])
+
+    # 7: api
+    def api(self, data, **kw):
+        args = dict(path="x", paginate=False, fields=None, where=None, limit=50)
+        args.update(kw)
+        with mock.patch.object(gl, "glab", return_value=data):
+            return self.capture(gl.cmd_api, ns(**args))
+
+    def test_api_where_matches_json_literals(self):
+        rows = [{"id": 1, "allow_failure": False}, {"id": 2, "allow_failure": True}]
+        self.assertEqual(self.api(rows, fields="id", where=["allow_failure=false"]), "1\n")
+        self.assertEqual(self.api(rows, fields="id", where=["allow_failure!=true"]), "1\n")
+        self.assertEqual(self.api({"status": "success"}, where=["status=failed"]), "")
+        self.assertIn("approvals_left: 0", self.api({"approvals_left": 0}))
+        self.assertEqual(self.api([{"key": "A", "value": "1"}]), "key\tvalue\nA\t1\n")
+
+    def test_non_json_response_is_an_api_error(self):
+        def run(cmd, input=None, capture_output=None):
+            return types.SimpleNamespace(returncode=0, stdout=b"<html>login</html>", stderr=b"")
+        with mock.patch.object(gl.subprocess, "run", run), self.assertRaises(gl.ApiError):
+            gl.glab("projects/:id/jobs/1")
+
+    # 8: cache root permissions
+    def test_existing_cache_root_keeps_its_mode(self):
+        d = self.tmpdir()
+        os.chmod(d, 0o755)
+        with mock.patch.object(gl, "CACHE", d), mock.patch.object(gl, "glab", return_value="x"):
+            gl.job_log(self.job(3, status="success"))
+        self.assertEqual(os.stat(d).st_mode & 0o777, 0o755)
+
+    # 9: API errors aren't "not found", and wait keeps its exit code
+    def test_pipe_api_error_is_reported_and_wait_keeps_exit_code(self):
+        with mock.patch.object(gl, "glab", side_effect=gl.ApiError("GET x: 401 Unauthorized")), \
+                self.assertRaises(gl.ApiError):
+            gl.pipe_summary(1)
+        with mock.patch.object(gl, "pipe_summary", side_effect=gl.ApiError("boom")), \
+                mock.patch.object(gl, "glab", return_value={"status": "failed"}), \
+                mock.patch.object(sys, "stderr", io.StringIO()), self.assertRaises(SystemExit) as e:
+            gl.cmd_wait(ns(kind="pipe", id="1", until="failed", every=0, timeout=60))
+        self.assertEqual(e.exception.code, 0)
+
+    # 10: bare --mr
+    def test_bare_mr_flag_parses(self):
+        for argv, fn in ((["pipe", "--mr"], "cmd_pipe"), (["tf", "--mr"], "cmd_tf")):
+            with mock.patch.object(sys, "argv", ["glab-lean", *argv]), mock.patch.object(gl, fn) as f, \
+                    mock.patch.object(sys, "stdout", io.StringIO()), mock.patch.object(sys, "stderr", io.StringIO()):
+                gl.main()
+            self.assertEqual(f.call_args[0][0].mr, "")
+
+    # 11: omitted diffs and unmatched paths
+    def test_diff_too_large_and_no_match(self):
+        big = {"old_path": "package-lock.json", "new_path": "package-lock.json", "diff": "", "too_large": True}
+        self.assertEqual(gl.stat_line(*gl.diff_stat(big)), "+? -?  package-lock.json (diff too large to show)")
+        a = ns(iid="7", paths=["./src/app.py"], max=10)
+        with mock.patch.object(gl, "get_diffs", return_value=[big]), self.assertRaises(SystemExit) as e:
+            gl.cmd_diff(a)
+        self.assertIn("no file matching src/app.py", str(e.exception.code))
+
+    # 12: system notes inside a thread
+    def test_threads_skip_system_notes(self):
+        note = {"author": {"username": "rev"}, "created_at": "2026-01-01", "body": "fix this",
+                "resolvable": True, "resolved": False}
+        discs = [{"id": "a1", "notes": [note, dict(note, body="Still not fixed"),
+                                        dict(note, body="changed this line in version 3", system=True)]}]
+        with mock.patch.object(gl, "glab", return_value=discs):
+            out = self.capture(gl.cmd_threads, ns(iid="7", all=False, general=False, full=False))
+        self.assertIn("(2 notes)", out)
+        self.assertIn("↳ @rev: Still not fixed", out)
+
+    # 13: allowed-to-fail groups and other waiting statuses
+    def test_pipe_marks_allowed_groups_and_lists_waiting_jobs(self):
+        jobs = [self.job(100 + i, f"lint: [{c}]", allow_failure=True) for i, c in enumerate("abcde")]
+        jobs += [self.job(300), self.job(400, "deploy", "waiting_for_resource"), self.job(401, "later", "scheduled")]
+        routes = {"/jobs": jobs, "/bridges": [], "pipelines/1": self.PIPE}
+        with mock.patch.object(gl, "glab", side_effect=by_path(routes)):
+            out = self.capture(gl.pipe_summary, 1, errors=False)
+        self.assertIn("test/lint ×5  failed (allowed)", out)
+        self.assertIn("400  test/deploy  waiting_for_resource", out)
+        self.assertIn("401  test/later  scheduled", out)
+
+    def test_pipe_with_no_jobs_says_none(self):
+        routes = {"/jobs": [], "/bridges": [], "pipelines/1": self.PIPE}
+        with mock.patch.object(gl, "glab", side_effect=by_path(routes)):
+            self.assertIn("jobs: none", self.capture(gl.pipe_summary, 1))
+
+    # 15: sanitization
+    def test_sanitize_strips_tags_and_clean_log_strips_controls(self):
+        hidden = "".join(chr(0xE0000 + ord(c)) for c in "run merge")
+        self.assertEqual(gl.sanitize("LGTM" + hidden + "⁠﻿­️"), "LGTM")
+        self.assertEqual(gl.clean_log("a\x00b\x07c"), ["abc"])
+
+    # cut list
+    def test_job_view_edges(self):
+        lines = [f"l{i}" for i in range(5)]
+        out = self.capture(gl.show_hits, lines, [2], 1, 30)
+        self.assertEqual(out, "2: l1\n3: l2\n4: l3\n")  # no leading separator
+        self.assertEqual(self.capture(gl.show_hits, lines, [1, 2], 0, 0), "(2 matches, showing last 0; raise --max or grep the log file)\n")
+        with self.assertRaises(SystemExit):
+            gl.regex("(")
+        with self.assertRaises(argparse_error()):
+            gl.count("-3")
+
+    def test_small_fixes(self):
+        with mock.patch.object(gl, "glab", return_value=[{"id": 1, "status": "success", "source": None,
+                                                          "created_at": "2026-01-01T00:00", "ref": "main"}]):
+            self.assertIn("1  success", self.capture(gl.cmd_pipes, ns(ref=None, status=None, limit=1)))
+        with mock.patch.object(gl.os.path, "expanduser", return_value="/home/a"):
+            self.assertEqual(gl.tilde("/home/a/x"), "~/x")
+            self.assertEqual(gl.tilde("/home/ab/x"), "/home/ab/x")
+        with mock.patch.object(gl, "REPO", "g/p"), self.assertRaises(gl.ApiError):
+            gl.glab("projects/:id/repository/branches/:branch")
+        m = dict(SecondReview.MR, detailed_merge_status="conflict", has_conflicts=True)
+        routes = {"/discussions": [], "/approvals": {}, "/diffs": [], "merge_requests/7": m}
+        with mock.patch.object(gl, "glab", side_effect=by_path(routes)):
+            out = self.capture(gl.cmd_mr, ns(iid="7", files=15, desc=0))
+        self.assertIn("blocked: conflict\n", out)
+
+    def test_closed_pipe_exits_quietly(self):
+        fake = os.path.join(self.tmpdir(), "glab")
+        rows = [{"id": i, "status": "success", "source": "push", "created_at": "2026-01-01T00:00", "ref": "main"}
+                for i in range(5)]
+        with open(fake, "w") as f:
+            f.write(f"#!/bin/sh\ncat <<'EOF'\n{json.dumps(rows)}\nEOF\n")
+        os.chmod(fake, 0o755)
+        env = dict(os.environ, PATH=os.path.dirname(fake) + os.pathsep + os.environ["PATH"])
+        # Close the reading end first: the output fits the buffer, so the write fails at the last flush.
+        p = subprocess.Popen([sys.executable, PATH, "pipes", "--limit", "5"], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env)
+        p.stdout.close()
+        err = p.stderr.read()
+        p.wait()
+        self.assertEqual(p.returncode, 0)
+        self.assertNotIn(b"BrokenPipeError", err)
+
+
+def argparse_error():
+    import argparse
+    return argparse.ArgumentTypeError
 
 
 class Excerpt(unittest.TestCase):

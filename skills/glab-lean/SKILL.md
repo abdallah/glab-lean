@@ -20,8 +20,8 @@ target another repo on the same host.
    `run_in_background: true`). You get notified when it exits. Don't write `sleep`/`until` loops
    and don't poll in the foreground.
 3. `glab-lean pipe` already prints the main error lines of up to three failed jobs; run
-   `glab-lean job` only when you need more. `glab-lean job` caches the full cleaned log and prints its path. For more detail, search that
-   file. Don't fetch the trace again.
+   `glab-lean job` only when you need more. `glab-lean job` caches the full cleaned log and prints
+   its path. For more detail, search that file. Don't fetch the trace again.
 4. For Terraform or OpenTofu, run `glab-lean tf`, then `glab-lean tf JOB -r ADDR` for one resource.
    Never print a whole plan log.
 5. Prefer `glab-lean` over a GitLab MCP server. MCP responses are unfiltered and can run to tens of
@@ -56,13 +56,19 @@ target another repo on the same host.
 For `note` and `reply`, pass `-` as the body to read it from stdin; use that for long or
 multi-line text.
 
-`glab-lean wait` exits `0` on success, `manual`, or `merged`, `1` on failure or cancel, `124` on
-timeout (default `--timeout 3600`, `--every 20`), and with an error message when the ID or project
-is wrong. `wait mr` exits `1` if the MR still has no pipeline after two minutes. With `--until`, it exits `0` when the state is reached and `1` if the job, pipeline, or MR
-finishes without reaching it.
+`glab-lean wait` exits `0` on success, `manual`, or `merged`, `1` on failure, cancel, or a closed
+MR, `124` on timeout (default `--timeout 3600`, `--every 20`), and with an error message when the
+ID or project is wrong. On the MR's own branch, `wait mr` waits for the pipeline of your local
+`HEAD`, so a pipeline from before your push doesn't count. It exits `1` at once if `HEAD` isn't
+pushed, and after two minutes if the MR still has no pipeline for its head commit. With `--until`,
+it exits `0` when the state is reached and `1` if the job, pipeline, or MR finishes without
+reaching it.
 
-`tf` finds plan jobs with `--name plan` (a regex on the job name). Use `--name 'tofu:plan'` or
-`--name apply` to pick other jobs; apply jobs report `Apply complete!` and errors.
+`tf` finds finished plan jobs with `--name plan` (a regex on the job name). Use
+`--name 'tofu:plan'` or `--name apply` to pick other jobs; apply jobs report `Apply complete!` and
+errors.
+
+In `api -w`, match booleans and null as JSON spells them: `-w allow_failure=false`.
 
 ## Examples
 

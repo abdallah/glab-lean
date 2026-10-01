@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """glab-lean: token-lean GitLab views for agents. Wraps `glab api` for auth and host.
 
-Every command prints a short, fixed-shape summary. Full job logs are cached on
-disk so follow-up searches use grep instead of another API call.
+Every command prints a short, fixed-shape summary. glab-lean caches full job logs on disk, so
+follow-up searches can use grep instead of another API call.
 """
 import argparse
 import collections
@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 
@@ -23,14 +24,15 @@ DONE_PIPE = {"success", "failed", "canceled", "skipped", "manual", "blocked"}
 OK_STATES = {"success", "manual", "blocked"}
 REPO = None
 MAX_PAGES = 50
-# Only relative REST paths on the host glab resolves. Absolute URLs would make glab send the
-# token to another host, so they're refused before glab sees them.
+# Only relative REST paths on the host glab resolves. An absolute URL would make glab send the
+# token to another host, so glab-lean refuses it before glab sees it.
 SAFE_PATH = re.compile(r"^(projects|merge_requests|groups|users?|version|issues|todos|runners|namespaces)(/|\?|$)")
 REPO_RX = re.compile(r"^[\w.-]+(/[\w.-]+)+$")
 # glab fills these from the repo it resolves; with -R they would point at the cwd's repo instead.
-PLACEHOLDERS = re.compile(r":(id|fullpath|group|namespace|repo)\b")
+PLACEHOLDERS = re.compile(r":(id|fullpath|group|namespace|repo|branch)\b")
 CACHE_DAYS = 14
-NO_PIPE_GRACE = 120  # seconds `wait mr` waits for an MR's first pipeline before giving up
+CACHE_FILE = re.compile(r"^\d+(\.partial)?\.log$|^\d+\..*\.tmp$")  # the only files prune_cache deletes
+NO_PIPE_GRACE = 120  # seconds `wait mr` waits for the MR's pipeline to catch up before giving up
 
 
 # ---------------------------------------------------------------- API helpers
@@ -54,7 +56,7 @@ def run_glab(cmd, inp):
 
 def glab(path, method="GET", body=None, raw=False, paginate=False):
     check_path(path)
-    if REPO and not paginate:
+    if REPO:
         # Name the project in the path rather than passing glab -R, which also accepts a host
         # prefix. glab then uses the host it resolves from the cwd or its default.
         path = re.sub(r"^projects/:id(?=/|\?|$)", "projects/" + enc(REPO), path)
@@ -64,8 +66,10 @@ def glab(path, method="GET", body=None, raw=False, paginate=False):
     if method != "GET":
         cmd += ["-X", method]
     if paginate:  # page by hand: `--output ndjson` needs a recent glab
-        rows, size = [], min(per_page(path), 100)  # GitLab caps per_page at 100
         sep = "&" if "?" in path else "?"
+        if not re.search(r"[?&]per_page=", path):
+            path, sep = f"{path}{sep}per_page=100", "&"
+        rows, size = [], min(per_page(path), 100)  # GitLab caps per_page at 100
         for page in range(1, MAX_PAGES + 1):
             chunk = glab(f"{path}{sep}page={page}", method, body, raw)
             if not isinstance(chunk, list):  # single-object endpoint: no pages
@@ -90,7 +94,10 @@ def glab(path, method="GET", body=None, raw=False, paginate=False):
     out = p.stdout.decode(errors="replace")
     if raw:
         return out
-    return json.loads(out) if out.strip() else None
+    try:
+        return json.loads(out) if out.strip() else None
+    except ValueError:  # a login page or proxy error instead of the API
+        raise ApiError(f"{method} {path}: response isn't JSON: {cut(out, 80)}") from None
 
 
 def per_page(path):
@@ -106,14 +113,17 @@ def enc(s):
     return urllib.parse.quote(str(s), safe="")
 
 
-def parallel(*fns):
+def parallel(*fns, need=0):
+    """Run fns at once. A failed call returns None, except that the first `need` calls re-raise."""
     with cf.ThreadPoolExecutor(len(fns)) as ex:
         futs = [ex.submit(f) for f in fns]
     out = []
-    for f in futs:
+    for n, f in enumerate(futs):
         try:
             out.append(f.result())
         except ApiError:
+            if n < need:
+                raise
             out.append(None)
     return out
 
@@ -121,8 +131,15 @@ def parallel(*fns):
 def branch():
     p = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
     if p.returncode != 0:
-        sys.exit("glab-lean: not in a git repo; pass an ID or -R group/project")
+        sys.exit("glab-lean: not in a git repo, so there's no current branch; pass an ID" +
+                 ("" if REPO else " (and -R group/project outside the repo)"))
     return p.stdout.strip()
+
+
+def git(*args):
+    """Output of a git command, or None outside a repo or on error."""
+    p = subprocess.run(["git", *args], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else None
 
 
 def dur(s):
@@ -143,44 +160,71 @@ def dig(d, key):
     return d
 
 
+def regex(s, flags=0):
+    try:
+        return re.compile(s, flags)
+    except re.error as e:
+        sys.exit(f"glab-lean: bad regex {s!r}: {e}")
+
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if home != "/" and path.startswith(home + os.sep) else path
+
+
+def merged_sha(m):
+    return (m.get("squash_commit_sha") or m.get("merge_commit_sha") or "")[:8]
+
+
 # ---------------------------------------------------------------- resolution
+
+def branch_mrs(b):
+    """Open MRs from branch b of this project. A fork's MR can share the branch name; skip it."""
+    mrs = glab(f"projects/:id/merge_requests?{q(source_branch=b, state='opened')}") or []
+    return [m for m in mrs if m.get("source_project_id", m.get("project_id")) == m.get("project_id")]
+
 
 def resolve_mr(iid):
     if iid:
         return int(str(iid).lstrip("!"))
     b = branch()
-    mrs = glab(f"projects/:id/merge_requests?{q(source_branch=b, state='opened')}")
+    mrs = branch_mrs(b)
     if not mrs:
         sys.exit(f"glab-lean: no open MR for branch {b}")
     return mrs[0]["iid"]
 
 
+def mr_pipeline(m):
+    """(pipeline ID, project) for an MR's head pipeline. A fork MR's pipeline can live in the fork."""
+    hp = m["head_pipeline"]
+    return hp["id"], str(hp.get("project_id") or ":id")
+
+
 def resolve_pipe(pid=None, mr=None, ref=None):
+    """Return (pipeline ID, project), where project is ":id" or a numeric project ID."""
     if pid:
-        return int(pid)
+        return int(pid), ":id"
     if mr is not None:
         m = glab(f"projects/:id/merge_requests/{resolve_mr(mr)}")
         if not m.get("head_pipeline"):
             sys.exit(f"glab-lean: !{m['iid']} has no pipeline yet")
-        return m["head_pipeline"]["id"]
+        return mr_pipeline(m)
     if ref:
         ps = glab(f"projects/:id/pipelines?{q(ref=ref, per_page=1)}")
         if not ps:
             sys.exit(f"glab-lean: no pipelines for ref {ref}")
-        return ps[0]["id"]
+        return ps[0]["id"], ":id"
     # The open MR's head pipeline is the one that gates the merge; the branch's newest pipeline
     # may be a branch pipeline that runs beside it, so it's only the fallback.
     b = branch()
-    mrs, ps = parallel(
-        lambda: glab(f"projects/:id/merge_requests?{q(source_branch=b, state='opened')}"),
-        lambda: glab(f"projects/:id/pipelines?{q(ref=b, per_page=1)}"),
-    )
+    mrs, ps = parallel(lambda: branch_mrs(b),
+                       lambda: glab(f"projects/:id/pipelines?{q(ref=b, per_page=1)}"), need=2)
     if mrs:
-        hp = glab(f"projects/:id/merge_requests/{mrs[0]['iid']}").get("head_pipeline")
-        if hp:
-            return hp["id"]
+        m = glab(f"projects/:id/merge_requests/{mrs[0]['iid']}")
+        if m.get("head_pipeline"):
+            return mr_pipeline(m)
     if ps:
-        return ps[0]["id"]
+        return ps[0]["id"], ":id"
     sys.exit(f"glab-lean: no pipelines for branch {b}")
 
 
@@ -189,10 +233,24 @@ def resolve_pipe(pid=None, mr=None, ref=None):
 TS = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z [0-9a-f]{2}[OE](\+| )?")
 SECTION = re.compile(r"section_(start|end):\d+:([^\r\s\[]+)(\[[^\]]*\])?\r?(\x1b\[0K)?")
 # Every escape form a terminal acts on: CSI, OSC (BEL or ST ended), DCS/SOS/PM/APC, 2-byte ESC,
-# and 8-bit CSI. Then any remaining C0/C1 control and invisible bidi/zero-width characters.
+# and 8-bit CSI. Then any remaining C0/C1 control and every invisible formatting character: soft
+# hyphen, bidi marks and overrides, zero-width and word-joiner characters, BOM, variation
+# selectors, and Unicode tags, which can spell out hidden text.
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|"
                   r"\x1b[PX^_][^\x1b]*(?:\x1b\\)?|\x1b[ -/]*[0-~]|\x9b[0-?]*[ -/]*[@-~]")
-CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
+CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e"
+                  "\u2060-\u2064\u2066-\u2069\ufe00-\ufe0f\ufeff\U000e0000-\U000e007f\U000e0100-\U000e01ef]")
+# clean_log writes each section start as "== name". GitLab section names have no spaces, which
+# keeps them apart from script output such as "== 2026... CreateUsers: migrating".
+MARK = re.compile(r"^== (\S+)$")
+# Sections the runner itself opens. A runner section runs until the next one, so a section the
+# script opens inside step_script doesn't end it.
+RUNNER_SECTION = re.compile(r"^(prepare_executor|prepare_script|resolve_secrets|get_sources|clear_worktree|"
+                            r"restore_cache|download_artifacts|step_\w+|build_script|after_script|"
+                            r"archive_cache(_on_failure)?|upload_artifacts_on_(success|failure)|"
+                            r"cleanup_file_variables)$")
+TRAILER = re.compile(r"^(archive_cache(_on_failure)?|upload_artifacts_on_(success|failure)|cleanup_file_variables)$")
+TRAILER_NOISE = re.compile(r"^ERROR: (Job failed|No files to upload)|no matching files")
 
 
 def sanitize(text):
@@ -213,6 +271,9 @@ class SafeOut:
         return getattr(self.stream, name)
 
 
+def section_start(mm):
+    return f"\n== {mm.group(2)}\n" if mm.group(1) == "start" else ""
+
 
 def clean_log(raw):
     out = []
@@ -221,18 +282,13 @@ def clean_log(raw):
         cont = bool(m and m.group(1) == "+")
         if m:
             line = line[m.end():]
-
-        def sec(mm):
-            return f"\n== {mm.group(2)}\n" if mm.group(1) == "start" else ""
-
-        line = SECTION.sub(sec, line)
-        line = ANSI.sub("", line)
+        line = ANSI.sub("", SECTION.sub(section_start, line))
         parts = []
         for seg in line.split("\n"):
             if "\r" in seg:
                 segs = [x for x in seg.split("\r") if x.strip()]
                 seg = segs[-1] if segs else ""
-            parts.append(seg.rstrip())
+            parts.append(CTRL.sub("", seg).rstrip())  # NULs would make grep treat the cache as binary
         if cont and out:
             out[-1] += parts[0]
             parts = parts[1:]
@@ -245,47 +301,74 @@ def job_meta(jid):
 
 
 def job_log(job):
-    """Return (lines, cache_path). Finished jobs are read from and written to cache."""
+    """Return (lines, cache path). Finished jobs are read from and written to the cache. The path
+    is None when the cache can't be written; the log is still returned."""
     m = re.match(r"https?://([^/]+)/(.+?)/-/jobs/", job["web_url"])
     slug = (m.group(1) + "/" + m.group(2)).replace("/", "_") if m else "unknown"
     path = os.path.join(CACHE, slug, f"{int(job['id'])}.log")
     done = job["status"] in DONE_JOB - {"manual"}
     if done and os.path.exists(path):
-        os.utime(path)  # recently used logs survive prune_cache()
+        try:
+            os.utime(path)  # recently read logs survive prune_cache()
+        except OSError:
+            pass
         with open(path, encoding="utf-8", errors="replace") as f:
             return f.read().split("\n"), path
-    lines = clean_log(glab(f"projects/:id/jobs/{job['id']}/trace", raw=True))
+    proj = (job.get("pipeline") or {}).get("project_id") or ":id"  # a fork MR's job lives in the fork
+    lines = clean_log(glab(f"projects/{proj}/jobs/{job['id']}/trace", raw=True))
     if not done:  # a partial trace must never be served later as the final log
         path = path[:-4] + ".partial.log"
+    try:
+        return lines, save_log(path, lines, keep=done and any(lines))
+    except OSError:
+        return lines, None
+
+
+def save_log(path, lines, keep):
     # Logs can hold secrets a job printed: keep the cache private to the user.
     folder = os.path.dirname(path)
+    if not os.path.isdir(CACHE):
+        os.makedirs(CACHE, mode=0o700)
     os.makedirs(folder, mode=0o700, exist_ok=True)
-    for d in (CACHE, folder):
-        st = os.stat(d)
-        if st.st_uid == os.getuid() and not st.st_mode & 0o1000:  # never chmod a shared dir like /tmp
-            os.chmod(d, 0o700)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    if os.stat(folder).st_uid == os.getuid():
+        os.chmod(folder, 0o700)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=os.path.basename(path)[:-4] + ".", suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+    if not keep and not path.endswith(".partial.log"):  # an empty final log: don't serve it later
+        path = path[:-4] + ".partial.log"
     os.replace(tmp, path)
-    if done:
+    if keep:
         try:
             os.unlink(path[:-4] + ".partial.log")
         except FileNotFoundError:
             pass
     prune_cache()
-    return lines, path
+    return path
 
 
 def prune_cache():
-    """Delete cached logs untouched for CACHE_DAYS. Reading a cached log keeps it."""
-    cutoff = time.time() - CACHE_DAYS * 86400
-    for folder, _, files in os.walk(CACHE):
-        for name in files:
+    """Once a day, delete cached logs nobody has read for CACHE_DAYS. Only glab-lean's own files
+    (<slug>/<job id>.log and its temp files) are touched, in case GLAB_LEAN_CACHE is shared."""
+    stamp = os.path.join(CACHE, ".glab-lean-pruned")
+    now = time.time()
+    try:
+        if os.path.exists(stamp) and os.stat(stamp).st_mtime > now - 86400:
+            return
+        open(stamp, "a").close()
+        os.utime(stamp)
+        folders = [os.path.join(CACHE, d) for d in os.listdir(CACHE)]
+    except OSError:
+        return
+    for folder in folders:
+        try:
+            names = os.listdir(folder) if os.path.isdir(folder) else []
+        except OSError:
+            continue
+        for name in names:
             f = os.path.join(folder, name)
             try:
-                if name.endswith((".log", ".tmp")) and os.stat(f).st_mtime < cutoff:
+                if CACHE_FILE.match(name) and os.stat(f).st_mtime < now - CACHE_DAYS * 86400:
                     os.unlink(f)
             except OSError:
                 pass
@@ -293,7 +376,9 @@ def prune_cache():
 
 ERR = re.compile(r"(?i)(\berror\b|\bfatal\b|exception|traceback|\bfail(ed|ure)?\b|exit code [1-9]|"
                  r"exit status [1-9]|permission denied|not found|timed? ?out|\bpanic\b)")
-NOISE = re.compile(r"(?i)(0 failed|failed=0|errors?: 0|--fail|ERROR_|allow_failure|set -e)")
+# Lines that match ERR but report success: zero-failure summaries, flags, and config.
+NOISE = re.compile(r"(?i)((?<![\w.])0 (fail(ed|ures?)?|errors?)\b|\b(fail(ed|ures?)?|errors?)\s*[=:]?\s*0\b(?![.\d])"
+                   r"|--fail|allow_failure|set -e)|(?-i:\bERROR_[A-Z])")
 
 
 def job_header(j):
@@ -303,48 +388,52 @@ def job_header(j):
             f"  pipeline {j['pipeline']['id']}  ref {j['ref']}{reason}")
 
 
+def log_note(path, lines):
+    if path is None:
+        return f"log: not cached (can't write {tilde(CACHE)}); {len(lines)} lines"
+    return f"log: {path} ({len(lines)} lines; grep it directly for more)"
+
+
+NO_LOG = ("created", "pending", "manual", "skipped", "scheduled", "waiting_for_resource", "preparing",
+          "waiting_for_callback")
+
+
 def cmd_job(a):
     j = job_meta(a.id)
     print(job_header(j))
-    if j["status"] in ("created", "pending", "manual", "skipped"):
+    if j["status"] in NO_LOG:
         return
     lines, path = job_log(j)
-    print(f"log: {path} ({len(lines)} lines; grep it directly for more)")
+    print(log_note(path, lines))
+    marks = sections(lines)
     if a.sections:
-        starts = [(i, l[3:]) for i, l in enumerate(lines) if l.startswith("== ")]
-        for n, (i, name) in enumerate(starts):
-            end = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
-            print(f"  {name}  lines {i + 1}-{end} ({end - i})")
+        for name, lo, hi in marks:
+            print(f"  {name}  lines {lo + 1}-{hi} ({hi - lo})")
         return
     if a.section:
-        on = False
-        for l in lines:
-            if l.startswith("== "):
-                on = a.section in l[3:]
-            elif on:
-                print(l)
+        for name, lo, hi in marks:
+            if a.section in name:
+                print("\n".join(lines[lo + 1:hi]))
         return
     if a.full:
         print("\n".join(lines))
         return
     if a.grep:
-        rx = re.compile(a.grep)
-        hits = [i for i, l in enumerate(lines) if rx.search(l)]
-        show_hits(lines, hits, a.context, a.max)
+        rx = regex(a.grep)
+        show_hits(lines, [i for i, l in enumerate(lines) if rx.search(l)], a.context, a.max)
         return
-    if a.tail or a.head:
-        sel = lines[: a.head] if a.head else lines[-a.tail:]
-        print("\n".join(sel))
+    if a.tail is not None or a.head is not None:
+        print("\n".join(lines[: a.head] if a.head is not None else lines[len(lines) - a.tail:]))
         return
     # Default: error lines, then the tail.
     tail_n = 25 if j["status"] == "failed" else 8
     end = body_end(lines)
-    hits = error_lines(lines, end)
     tail_from = max(0, end - tail_n)
-    hits = [i for i in hits if i < tail_from]
-    if hits and j["status"] == "failed":
-        print(f"-- error-like lines ({len(hits)}) --")
-        show_hits(lines, hits, 0, a.max)
+    if j["status"] == "failed":
+        hits = [i for i in error_lines(lines, end) if i < tail_from]
+        if hits:
+            print(f"-- error-like lines ({len(hits)}) --")
+            show_hits(lines, hits, 0, a.max)
     print("-- tail --")
     print("\n".join(l for l in lines[tail_from:end] if l))
 
@@ -352,92 +441,122 @@ def cmd_job(a):
 def show_hits(lines, hits, ctx, mx):
     if len(hits) > mx:
         print(f"({len(hits)} matches, showing last {mx}; raise --max or grep the log file)")
-        hits = hits[-mx:]
-    last = -2
+        hits = hits[len(hits) - mx:]
+    last = -1
     for i in hits:
         lo, hi = max(0, i - ctx), min(len(lines), i + ctx + 1)
-        if ctx and lo > last + 1:
+        if ctx and last >= 0 and lo > last + 1:
             print("--")
         for k in range(max(lo, last + 1), hi):
             print(f"{k + 1}: {cut(lines[k], 400)}")
         last = hi - 1
 
 
+def sections(lines):
+    """(name, marker index, end index) for each section. A runner section ends at the next runner
+    section; a section the script opened ends at the next section of any kind."""
+    marks = [(i, MARK.match(l).group(1)) for i, l in enumerate(lines) if MARK.match(l)]
+    out = []
+    for n, (i, name) in enumerate(marks):
+        later = marks[n + 1:]
+        if RUNNER_SECTION.match(name):
+            later = [m for m in later if RUNNER_SECTION.match(m[1])]
+        out.append((name, i, later[0][0] if later else len(lines)))
+    return out
+
+
 def body_end(lines):
-    """Index where the runner's own cleanup sections start."""
+    """Index where the runner's trailing sections (artifacts, cache, cleanup) start. They're kept
+    when they hold a real error, such as an artifact upload that failed the job."""
     end = len(lines)
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].startswith("== ") and re.search(r"upload_artifacts|cleanup|archive_cache", lines[i]):
-            end = i
+    for name, i, _ in reversed(sections(lines)):
+        if not TRAILER.match(name):
+            break
+        end = i
+    if any(l.startswith("ERROR: ") and not TRAILER_NOISE.search(l) for l in lines[end:]):
+        return len(lines)
     return end
 
 
-def error_lines(lines, end):
-    return [i for i, l in enumerate(lines[:end]) if ERR.search(l) and not NOISE.search(l) and not l.startswith("$ ")]
+def error_lines(lines, end, start=0):
+    return [i for i in range(start, end) if ERR.search(lines[i]) and not NOISE.search(lines[i])
+            and not lines[i].startswith("$ ")]
 
 
 RUNNER = re.compile(r"(Executing \"step_script\"|Using (effective pull policy|docker image|Docker executor)|"
-                    r"Pulling docker image|Running on |Preparing (the|environment)|Skipping Git|Fetching changes|"
-                    r"Checking out |Created fresh repository|Getting source from|Resolving secrets|Waiting for pod)")
+                    r"Pulling docker image|Running on |Running after_script|Preparing (the|environment)|"
+                    r"Skipping Git|Fetching changes|Checking out |Created fresh repository|Getting source from|"
+                    r"Resolving secrets|Waiting for pod)")
 
 
 def error_excerpt(job, n=10):
-    """Why a job failed, in a few lines: its last error-like lines plus the distinct messages at the
-    end of its log. Lines that differ only in their first word (one per locale, host, file, …) are
-    shown once with a count. Returns (lines, cached log path)."""
+    """Why a job failed, in a few lines: its first and last error-like lines plus the distinct
+    messages at the end of its script. Lines that differ only in their first word (one per locale,
+    host, file, …) appear once with a count. Returns (lines, cached log path or None)."""
     try:
         lines, path = job_log(job)
-    except ApiError:
+    except (ApiError, OSError):
         return [], None
     end = body_end(lines)
+    marks = sections(lines)
+    script = next(((lo + 1, hi) for name, lo, hi in marks if name == "step_script"), None)
+    start, stop = script or (0, end)  # the script's own output, without setup and after_script
+    stop = min(stop, end)
 
     def shape(line):
         return " ".join(line.split()[1:]) or line
 
-    start = next((i + 1 for i, l in enumerate(lines[:end]) if l == "== step_script"), 0)  # skip runner setup
-    window = [i for i in range(start, end) if lines[i].strip() and not lines[i].startswith(("$ ", "== "))
-              and not RUNNER.match(lines[i])][-40:]
-    counts = collections.Counter(shape(lines[i]) for i in window)
-    latest = {shape(lines[i]): i for i in window}  # last line of each shape
+    body = [i for i in range(start, stop) if re.search(r"\w", lines[i]) and not MARK.match(lines[i])
+            and not lines[i].startswith("$ ") and not RUNNER.match(lines[i])]
+    counts = collections.Counter(shape(lines[i]) for i in body)
+    latest = {shape(lines[i]): i for i in body[-40:]}  # last line of each shape
     tail = sorted(latest.values())[-8:]
     shapes = {shape(lines[i]) for i in tail}
-    errs = [i for i in error_lines(lines, end)[-5:] if i >= start and shape(lines[i]) not in shapes]
+    found = [i for i in error_lines(lines, stop, start) if shape(lines[i]) not in shapes]
+    errs = sorted(set(found[:1] + found[-4:]))  # the first error is often the cause
+    pick = sorted(errs + tail)
+    if len(pick) > n:
+        first = errs[:1]
+        pick = first + [i for i in pick if i not in first][len(pick) - n:]
     out = []
-    for i in sorted(errs + tail)[-n:]:
+    for i in pick:
         c = counts[shape(lines[i])] if i in tail else 1
         out.append(cut(lines[i], 200) + (f"  (×{c})" if c > 1 else ""))
-    return out, path.replace(os.path.expanduser("~"), "~", 1)
+    return out, tilde(path) if path else None
 
 
 # ---------------------------------------------------------------- pipelines
 
-def pipe_summary(pid, show_all=False, errors=True):
+ORDER = {"failed": 0, "running": 1, "canceling": 2, "pending": 3, "preparing": 4, "waiting_for_resource": 5,
+         "waiting_for_callback": 6, "scheduled": 7, "manual": 8, "canceled": 9, "created": 10}
+
+
+def pipe_summary(pid, show_all=False, errors=True, proj=":id"):
+    base_url = f"projects/{proj}/pipelines/{pid}"
     p, jobs, bridges = parallel(
-        lambda: glab(f"projects/:id/pipelines/{pid}"),
-        lambda: glab(f"projects/:id/pipelines/{pid}/jobs?per_page=100", paginate=True),
-        lambda: glab(f"projects/:id/pipelines/{pid}/bridges?per_page=100", paginate=True),
+        lambda: glab(base_url),
+        lambda: glab(f"{base_url}/jobs?per_page=100", paginate=True),
+        lambda: glab(f"{base_url}/bridges?per_page=100", paginate=True),
+        need=1,
     )
-    if p is None:
-        sys.exit(f"glab-lean: pipeline {pid} not found")
     if jobs is None:
         print("glab-lean: jobs unavailable (API error); rerun to see them", file=sys.stderr)
+    if bridges is None:
+        print("glab-lean: child pipelines unavailable (API error); rerun to see them", file=sys.stderr)
     jobs, bridges = jobs or [], bridges or []
     print(f"pipeline {p['id']} {p['status']}  ref {p['ref']}  sha {p['sha'][:8]}  {dur(p.get('duration'))}"
           f"  source {p.get('source')}\n{p['web_url']}")
-    counts = {}
-    for j in jobs:
-        counts[j["status"]] = counts.get(j["status"], 0) + 1
-    print("jobs: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda x: -x[1])))
-    order = {"failed": 0, "running": 1, "pending": 2, "manual": 3, "canceled": 4, "created": 5}
-    rows = jobs if show_all else [j for j in jobs if j["status"] in order]
+    counts = collections.Counter(j["status"] for j in jobs)
+    print("jobs: " + (", ".join(f"{v} {k}" for k, v in counts.most_common()) or "none"))
+    rows = jobs if show_all else [j for j in jobs if j["status"] in ORDER]
     groups = {}
-    for j in sorted(rows, key=lambda j: (order.get(j["status"], 9), j["stage"], j["name"])):
+    for j in sorted(rows, key=lambda j: (ORDER.get(j["status"], 99), j["stage"], j["name"])):
         base = re.sub(r"[:\s]*\[[^\]]*\]$", "", j["name"]) if not show_all else j["id"]
-        groups.setdefault((j["status"], j["stage"], base), []).append(j)
+        allowed = bool(j.get("allow_failure")) and j["status"] == "failed"
+        groups.setdefault((j["status"], j["stage"], base, allowed), []).append(j)
     # Answer "which failed, and why" in one call: error lines for up to 3 blocking failures,
     # spread across groups so a failing matrix doesn't use up all three.
-    blocking = [[j for j in js if j["status"] == "failed" and not j.get("allow_failure")]
-                for js in groups.values()]
+    blocking = [js for (status, _, _, allowed), js in groups.items() if status == "failed" and not allowed]
     failed = [js[k] for k in range(3) for js in blocking if k < len(js)][:3]
     excerpts = {}
     if failed and errors:
@@ -451,17 +570,19 @@ def pipe_summary(pid, show_all=False, errors=True):
         if path:
             print(f"{indent}log: {path}")
 
-    for (status, stage, base), js in groups.items():
+    for (status, stage, base, allowed), js in groups.items():
+        extra = " (allowed)" if allowed else ""
         if len(js) > 3:  # parallel:matrix fan-out: one line per group
             ids = sorted(j["id"] for j in js)
-            print(f"  {ids[0]}..{ids[-1]}  {stage}/{base} ×{len(js)}  {status}  (--all for each)")
+            reasons = ",".join(sorted({j["failure_reason"] for j in js if j.get("failure_reason")}))
+            reason = f"  {reasons}" if reasons and status == "failed" else ""
+            print(f"  {ids[0]}..{ids[-1]}  {stage}/{base} ×{len(js)}  {status}{extra}{reason}  (--all for each)")
             for j in js:
                 if j["id"] in excerpts:
                     print(f"    {j['id']}  {j['name']}")
                     show_excerpt(j, "      ")
             continue
         for j in js:
-            extra = " (allowed)" if j.get("allow_failure") and status == "failed" else ""
             reason = f"  {j['failure_reason']}" if j.get("failure_reason") and status == "failed" else ""
             print(f"  {j['id']}  {stage}/{j['name']}  {status}{extra}{reason}")
             show_excerpt(j, "      ")
@@ -472,33 +593,51 @@ def pipe_summary(pid, show_all=False, errors=True):
 
 
 def cmd_pipe(a):
-    pipe_summary(resolve_pipe(a.id, a.mr, a.ref), a.all, not a.brief)
+    pid, proj = resolve_pipe(a.id, a.mr, a.ref)
+    pipe_summary(pid, a.all, not a.brief, proj)
 
 
 def cmd_pipes(a):
     ps = glab(f"projects/:id/pipelines?{q(ref=a.ref, status=a.status, per_page=a.limit)}")
     for p in ps:
-        print(f"{p['id']}  {p['status']:9} {p['source']:22} {p['created_at'][:16]}  {p['ref']}")
+        print(f"{p['id']}  {p['status']:9} {p.get('source') or '-':22} {(p.get('created_at') or '')[:16]}  {p['ref']}")
 
 
 # ---------------------------------------------------------------- waiting
+
+JOB_DEFAULTS = dict(sections=False, section=None, full=False, grep=None, tail=None, head=None, max=30, context=0)
+
 
 def cmd_wait(a):
     until = set(a.until.split(",")) if a.until else set()
     started = time.time()
     if a.kind == "mr":
         iid = resolve_mr(a.id)
+        # On the MR's own branch, the local HEAD tells us which commit should be under test, so a
+        # pipeline from before a push isn't taken as the answer.
+        local = None if REPO else git("rev-parse", "HEAD")
+        here = None if REPO else git("rev-parse", "--abbrev-ref", "HEAD")
 
         def poll():
             m = glab(f"projects/:id/merge_requests/{iid}")
             if until:
-                hit = m["state"] in until or m.get("detailed_merge_status") in until
+                hit = bool(until & {m["state"], m.get("detailed_merge_status"), m.get("merge_status")})
                 return m["state"], hit or m["state"] in ("merged", "closed"), hit, m
+            if m["state"] in ("merged", "closed"):
+                return m["state"], True, m["state"] == "merged", m
+            late = time.time() >= started + NO_PIPE_GRACE  # GitLab had time to catch up
+            if local and m.get("source_branch") == here and m["sha"] != local:
+                upstream = git("rev-parse", "@{u}")
+                if upstream and upstream != local:
+                    return "not-pushed", True, False, m
+                return "mr-not-updated", late, False, m  # pushed; GitLab hasn't refreshed the MR yet
             hp = m.get("head_pipeline")
             if not hp:  # a pipeline can take a moment to appear after a push
-                return "no-pipeline", time.time() >= started + NO_PIPE_GRACE, False, m
+                return "no-pipeline", late, False, m
+            if not on_head(hp, m):
+                return "stale-pipeline", late, False, m
             st = hp["status"]
-            return st, st in DONE_PIPE and on_head(hp, m), st in OK_STATES, m
+            return st, st in DONE_PIPE, st in OK_STATES, m
     else:
         url = f"projects/:id/{'jobs' if a.kind == 'job' else 'pipelines'}/{int(a.id)}"
         final = DONE_JOB if a.kind == "job" else DONE_PIPE
@@ -526,28 +665,47 @@ def cmd_wait(a):
             print(f"timeout after {a.timeout}s; last status: {st}")
             sys.exit(124)
         time.sleep(a.every)
-    if a.kind == "job":
-        cmd_job(argparse.Namespace(id=int(a.id), sections=False, section=None, full=False, grep=None,
-                                   tail=None, head=None, max=30, context=0))
-    elif a.kind == "pipe":
-        pipe_summary(int(a.id))
-    elif until or not (obj.get("head_pipeline") or {}).get("id"):
-        note = "" if until else f"  no pipeline after {NO_PIPE_GRACE}s"
-        print(f"!{obj['iid']} {obj['state']} merge_status {obj.get('detailed_merge_status')}{note}")
-    else:
-        pipe_summary(obj["head_pipeline"]["id"])
+    why = {"no-pipeline": f"no pipeline after {NO_PIPE_GRACE}s",
+           "stale-pipeline": f"no pipeline for the head commit after {NO_PIPE_GRACE}s",
+           "mr-not-updated": f"the MR still isn't on your pushed commit after {NO_PIPE_GRACE}s",
+           "not-pushed": "your local HEAD isn't pushed; push it first"}.get(st)
+    try:  # the exit code reports what was waited for, even if the summary can't be fetched
+        if a.kind == "job":
+            cmd_job(argparse.Namespace(id=int(a.id), **JOB_DEFAULTS))
+        elif a.kind == "pipe":
+            pipe_summary(int(a.id))
+        elif until or why or not (obj.get("head_pipeline") or {}).get("id"):
+            note = f"  {why}" if why else ""
+            print(f"!{obj['iid']} {obj['state']} merge_status {obj.get('detailed_merge_status')}{note}")
+        else:
+            pid, proj = mr_pipeline(obj)
+            pipe_summary(pid, proj=proj)
+    except ApiError as e:
+        print(f"glab-lean: summary unavailable: {e}", file=sys.stderr)
     sys.exit(0 if ok else 1)
 
 
 # ---------------------------------------------------------------- merge requests
 
+def omitted(d):
+    """True when GitLab left the patch out because it's too large to return."""
+    return bool(d.get("too_large") or (d.get("collapsed") and not d.get("diff")))
+
+
 def diff_stat(d):
+    """(added, removed, label). Counts are None when GitLab omitted the patch."""
     lines = d.get("diff", "").splitlines()
-    add = sum(1 for l in lines if l.startswith("+"))
-    rem = sum(1 for l in lines if l.startswith("-"))
     tag = " (new)" if d.get("new_file") else " (deleted)" if d.get("deleted_file") else \
         f" (from {d['old_path']})" if d.get("renamed_file") else ""
+    if omitted(d):
+        return None, None, f"{d['new_path']}{tag} (diff too large to show)"
+    add = sum(1 for l in lines if l.startswith("+"))
+    rem = sum(1 for l in lines if l.startswith("-"))
     return add, rem, f"{d['new_path']}{tag}"
+
+
+def stat_line(add, rem, name):
+    return f"+{'?' if add is None else add} -{'?' if rem is None else rem}  {name}"
 
 
 def get_diffs(iid):
@@ -581,9 +739,8 @@ def cmd_mr(a):
         lambda: glab(f"projects/:id/merge_requests/{iid}/approvals"),
         lambda: glab(f"projects/:id/merge_requests/{iid}/discussions?per_page=100", paginate=True),
         lambda: get_diffs(iid),
+        need=1,
     )
-    if m is None:
-        sys.exit(f"glab-lean: MR !{iid} not found")
     draft = " [draft]" if m.get("draft") else ""
     print(f"!{m['iid']}{draft} {m['title']}")
     print(f"{m['state']}  {m['source_branch']} → {m['target_branch']}  by @{m['author']['username']}"
@@ -593,7 +750,7 @@ def cmd_mr(a):
     pending = ms in ("checking", "unchecked", "cannot_be_merged_recheck", "approvals_syncing", "preparing")
     if m["state"] == "opened" and ms not in ("mergeable", "can_be_merged") and not pending:
         blockers.append(ms)
-    if m.get("has_conflicts"):
+    if m.get("has_conflicts") and "conflict" not in str(ms):
         blockers.append("conflicts")
     if appr:
         left = appr.get("approvals_left", 0)
@@ -618,7 +775,7 @@ def cmd_mr(a):
               f"{ms} per GitLab, but threads are unavailable; rerun to confirm" if discs is None else
               "ready to merge")
     elif m["state"] == "merged":
-        print(f"merged {str(m.get('merged_at'))[:16]}  sha {(m.get('squash_commit_sha') or m.get('merge_commit_sha') or '')[:8]}")
+        print(f"merged {str(m.get('merged_at'))[:16]}  sha {merged_sha(m)}")
     meta = []
     if m.get("labels"):
         meta.append("labels " + ",".join(m["labels"]))
@@ -630,9 +787,11 @@ def cmd_mr(a):
         print("files: unavailable (API error)")
     else:
         stats = [diff_stat(d) for d in diffs]
-        print(f"files ({len(stats)}, +{sum(s[0] for s in stats)} -{sum(s[1] for s in stats)}):")
-        for add, rem, name in stats[: a.files]:
-            print(f"  +{add} -{rem}  {name}")
+        big = sum(1 for s in stats if s[0] is None)
+        note = f"; {big} too large to count" if big else ""
+        print(f"files ({len(stats)}, +{sum(s[0] or 0 for s in stats)} -{sum(s[1] or 0 for s in stats)}{note}):")
+        for st in stats[: a.files]:
+            print("  " + stat_line(*st))
         if len(stats) > a.files:
             print(f"  … {len(stats) - a.files} more (glab-lean diff {iid})")
     desc = (m.get("description") or "").strip()
@@ -645,6 +804,15 @@ def cmd_mr(a):
             print(f"  … {len(dl) - n} more lines (--desc -1)")
 
 
+def repo_path(p):
+    """A path as GitLab spells it: relative to the repo root, without a leading ./"""
+    if os.path.isabs(p):
+        top = git("rev-parse", "--show-toplevel")
+        if top:
+            p = os.path.relpath(p, top)
+    return re.sub(r"^(\./)+", "", p)
+
+
 def cmd_diff(a):
     if a.iid and not re.fullmatch(r"!?\d+", a.iid):  # `diff src/app.py`: the first arg is a path
         a.paths.insert(0, a.iid)
@@ -653,17 +821,24 @@ def cmd_diff(a):
     diffs = get_diffs(iid)
     if not a.paths:
         for d in diffs:
-            add, rem, name = diff_stat(d)
-            print(f"+{add} -{rem}  {name}")
+            print(stat_line(*diff_stat(d)))
         return
+    want = [repo_path(p) for p in a.paths]
+    shown = 0
     for d in diffs:
-        if not any(p in d["new_path"] or p in d["old_path"] for p in a.paths):
+        if not any(p in d["new_path"] or p in d["old_path"] for p in want):
+            continue
+        shown += 1
+        print(f"--- {d['old_path']}\n+++ {d['new_path']}")
+        if omitted(d):
+            print("(GitLab omits this diff because it's too large; view it in the MR)")
             continue
         lines = d.get("diff", "").splitlines()
-        print(f"--- {d['old_path']}\n+++ {d['new_path']}")
         print("\n".join(lines[: a.max]))
         if len(lines) > a.max:
             print(f"… {len(lines) - a.max} more lines (--max)")
+    if not shown:
+        sys.exit(f"glab-lean: !{iid} changes no file matching {', '.join(want)}")
 
 
 def cmd_threads(a):
@@ -676,18 +851,18 @@ def cmd_threads(a):
         discs = [d for d in discs if not any(n.get("resolvable") for n in d["notes"])]
     kind = "general comments" if a.general else "threads" if a.all else "unresolved threads"
     print(f"!{iid}: {len(discs)} {kind}")
-    lim = 100000 if a.full else 400
     for d in discs:
-        n0 = d["notes"][0]
+        notes = [n for n in d["notes"] if not n.get("system")]  # e.g. "changed this line in version 3"
+        n0 = notes[0]
         pos = n0.get("position") or {}
         loc = f"{pos.get('new_path') or pos.get('old_path')}:{pos.get('new_line') or pos.get('old_line')}" \
             if pos else "general"
         res = " resolved" if all(n.get("resolved") for n in d["notes"] if n.get("resolvable")) and \
             any(n.get("resolvable") for n in d["notes"]) else ""
         print(f"\n[{d['id']}] {loc}  @{n0['author']['username']} {n0['created_at'][:10]}"
-              f"  ({len(d['notes'])} notes){res}")
-        print("  " + (n0["body"] if a.full else cut(n0["body"], lim)))
-        replies = d["notes"][1:] if a.full else d["notes"][-1:] if len(d["notes"]) > 1 else []
+              f"  ({len(notes)} notes){res}")
+        print("  " + (n0["body"] if a.full else cut(n0["body"], 400)))
+        replies = notes[1:] if a.full else notes[-1:] if len(notes) > 1 else []
         for n in replies:
             print(f"  ↳ @{n['author']['username']}: {n['body'] if a.full else cut(n['body'], 250)}")
 
@@ -724,7 +899,8 @@ SYM = {"will be created": "+", "will be destroyed": "-", "will be updated in-pla
        "has been deleted": "drift-"}
 TF_END = re.compile(r"^(Plan: |No changes\.|Changes to Outputs:|Apply complete!|Destroy complete!|"
                     r"─{10}|Saved the plan|Warning: |Terraform will perform|OpenTofu will perform)")
-TF_TOTAL = re.compile(r"^(Plan: .*|No changes\..*|Apply complete!.*|Destroy complete!.*)")
+TF_TOTAL = re.compile(r"^(Plan: .*|No changes\..*|Apply complete!.*|Destroy complete!.*|Changes to Outputs:|"
+                      r"This is a refresh-only plan.*)")
 TF_ERR = re.compile(r"^[│|]?\s*Error: ")
 
 
@@ -765,12 +941,13 @@ def tf_block(lines, start, full):
 
 
 def tf_jobs(a):
+    """The jobs to read: the one given, or the pipeline's finished jobs whose names match --name."""
     if a.job:
-        return [a.job]
-    pid = resolve_pipe(a.pipe, a.mr)
-    jobs = glab(f"projects/:id/pipelines/{pid}/jobs?per_page=100", paginate=True)
-    rx = re.compile(a.name, re.I)
-    sel = [j["id"] for j in jobs if rx.search(j["name"]) and j["status"] not in ("created", "manual", "skipped")]
+        return [job_meta(a.job)]
+    pid, proj = resolve_pipe(a.pipe, a.mr)
+    jobs = glab(f"projects/{proj}/pipelines/{pid}/jobs?per_page=100", paginate=True)
+    rx = regex(a.name, re.I)
+    sel = [j for j in jobs if rx.search(j["name"]) and j["status"] in ("success", "failed", "canceled")]
     if not sel:
         names = ", ".join(sorted({f"{j['name']}({j['status']})" for j in jobs}))
         sys.exit(f"glab-lean: no finished jobs matching /{a.name}/ in pipeline {pid}; jobs: {cut(names, 300) or 'none (external or empty pipeline)'}")
@@ -778,11 +955,12 @@ def tf_jobs(a):
 
 
 def cmd_tf(a):
-    for jid in tf_jobs(a):
-        j = job_meta(jid)
-        lines, path = job_log(j)
+    jobs = tf_jobs(a)
+    with cf.ThreadPoolExecutor(min(len(jobs), 4)) as ex:  # fetch the logs at once, print in order
+        logs = list(ex.map(job_log, jobs))
+    for j, (lines, path) in zip(jobs, logs):
         res, totals, errs = tf_parse(lines)
-        print(f"{job_header(j)}\nlog: {path}")
+        print(f"{job_header(j)}\nlog: {path or 'not cached (cache not writable)'}")
         if a.resource:
             hits = [r for r in res if a.resource in r[2]]
             if not hits:
@@ -804,7 +982,7 @@ def cmd_tf(a):
             print(t)
         for e in errs[:10]:
             print(cut(e, 500))
-        if not (plan or totals or errs):
+        if not (res or totals or errs):
             print("  no plan output found; try `glab-lean job` on it")
 
 
@@ -859,7 +1037,7 @@ def cmd_merge(a):
         # auto_merge and would merge at once, so send both.
         body["auto_merge"] = body["merge_when_pipeline_succeeds"] = True
     m = glab(f"projects/:id/merge_requests/{iid}/merge", "PUT", body)
-    sha = (m.get("squash_commit_sha") or m.get("merge_commit_sha") or "")[:8]
+    sha = merged_sha(m)
     auto = "  auto-merge set" if m.get("merge_when_pipeline_succeeds") and m["state"] != "merged" else ""
     print(f"!{iid} {m['state']}{auto}  {sha}")
 
@@ -892,32 +1070,51 @@ def cmd_resolve(a):
 
 # ---------------------------------------------------------------- generic API
 
+def as_text(v):
+    """A JSON value as -w compares it: true, false, and null are spelled as in JSON."""
+    return "true" if v is True else "false" if v is False else "null" if v is None else str(v)
+
+
+def matches(v, want):
+    return want in (as_text(v), str(v))
+
+
 def cmd_api(a):
-    path = a.path
-    data = glab(path, paginate=a.paginate)
-    if isinstance(data, dict) and not a.fields:
-        for k, v in data.items():
-            if not isinstance(v, (dict, list)) and v not in (None, "", False):
-                print(f"{k}: {cut(str(v), 200)}")
-            elif isinstance(v, dict) and ("id" in v or "status" in v):
-                print(f"{k}: " + " ".join(f"{kk}={v[kk]}" for kk in ("id", "iid", "status", "name") if kk in v))
+    data = glab(a.path, paginate=a.paginate)
+    if not isinstance(data, (dict, list)):
+        print(as_text(data))
         return
     rows = data if isinstance(data, list) else [data]
     for w in a.where or []:
         mm = re.match(r"([\w.]+)(!=|=|~)(.*)", w)
         if not mm:
-            sys.exit(f"glab-lean: bad --where {w!r}; use key=val, key!=val or key~regex")
+            sys.exit(f"glab-lean: bad --where {w!r}; use key=val, key!=val, or key~regex")
         k, op, v = mm.groups()
         if op == "=":
-            rows = [r for r in rows if str(dig(r, k)) == v]
+            rows = [r for r in rows if matches(dig(r, k), v)]
         elif op == "!=":
-            rows = [r for r in rows if str(dig(r, k)) != v]
+            rows = [r for r in rows if not matches(dig(r, k), v)]
         else:
-            rows = [r for r in rows if re.search(v, str(dig(r, k)))]
-    fields = a.fields.split(",") if a.fields else \
-        [f for f in ("id", "iid", "name", "title", "status", "state", "ref", "stage") if rows and f in rows[0]]
-    for r in rows[: a.limit]:
-        print("\t".join(cut(str(dig(r, f)), 120) for f in fields))
+            rx = regex(v)
+            rows = [r for r in rows if rx.search(as_text(dig(r, k)))]
+    if isinstance(data, dict) and not a.fields:
+        for k, v in (rows[0].items() if rows else []):
+            if not isinstance(v, (dict, list)) and v is not None and v != "" and v is not False:
+                print(f"{k}: {cut(as_text(v), 200)}")
+            elif isinstance(v, dict) and ("id" in v or "status" in v):
+                print(f"{k}: " + " ".join(f"{kk}={v[kk]}" for kk in ("id", "iid", "status", "name") if kk in v))
+        return
+    if rows and not isinstance(rows[0], dict):  # a list of plain values
+        for r in rows[: a.limit]:
+            print(cut(as_text(r), 120))
+    else:
+        fields = a.fields.split(",") if a.fields else \
+            [f for f in ("id", "iid", "name", "title", "status", "state", "ref", "stage") if rows and f in rows[0]]
+        if rows and not fields:  # none of the usual keys: show the first scalar ones, with a header
+            fields = [k for k, v in rows[0].items() if not isinstance(v, (dict, list))][:6]
+            print("\t".join(fields))
+        for r in rows[: a.limit]:
+            print("\t".join(cut(as_text(dig(r, f)), 120) for f in fields))
     if len(rows) > a.limit:
         print(f"… {len(rows) - a.limit} more (--limit)", file=sys.stderr)
 
@@ -931,9 +1128,17 @@ def disc_id(s):
 
 
 def mr_iid(s):
+    if s == "":  # bare --mr: the current branch's MR
+        return s
     if not re.fullmatch(r"!?\d+", s):
         raise argparse.ArgumentTypeError("MR IIDs are numbers, like 42 or !42")
     return s.lstrip("!")
+
+
+def count(s):
+    if not re.fullmatch(r"\d+", s):
+        raise argparse.ArgumentTypeError("expected a whole number, 0 or more")
+    return int(s)
 
 
 def main():
@@ -992,13 +1197,13 @@ def main():
     p = sp.add_parser("job", help="job status and log extract; full log cached on disk")
     p.add_argument("id", type=int)
     p.add_argument("--grep", metavar="RE")
-    p.add_argument("-C", "--context", type=int, default=0)
-    p.add_argument("--tail", type=int)
-    p.add_argument("--head", type=int)
+    p.add_argument("-C", "--context", type=count, default=0)
+    p.add_argument("--tail", type=count)
+    p.add_argument("--head", type=count)
     p.add_argument("--sections", action="store_true", help="list log sections")
     p.add_argument("--section", metavar="NAME", help="print one section")
     p.add_argument("--full", action="store_true")
-    p.add_argument("--max", type=int, default=30)
+    p.add_argument("--max", type=count, default=30)
     p.set_defaults(fn=cmd_job)
 
     p = sp.add_parser("wait", help="block silently until a job/pipeline/MR settles, then summarize")
@@ -1013,7 +1218,7 @@ def main():
     p.add_argument("job", nargs="?", type=int)
     p.add_argument("--pipe", type=int)
     p.add_argument("--mr", nargs="?", const="", type=mr_iid)
-    p.add_argument("--name", default="plan", help="job-name regex when using --pipe/--mr")
+    p.add_argument("--name", default="plan", help="job-name regex for finished jobs, with --pipe/--mr")
     p.add_argument("-r", "--resource", help="show the change block for resources containing this")
     p.add_argument("--full", action="store_true", help="with -r: include unchanged lines")
     p.add_argument("--max", type=int, default=60)
@@ -1067,7 +1272,8 @@ def main():
     p = sp.add_parser("api", help="GET any endpoint as TSV/key: value (replaces jq/python glue)")
     p.add_argument("path", help="e.g. 'projects/:id/pipelines?ref=main'")
     p.add_argument("-f", "--fields", help="comma list; dots for nesting (pipeline.id)")
-    p.add_argument("-w", "--where", action="append", help="key=val, key!=val, key~regex")
+    p.add_argument("-w", "--where", action="append",
+                   help="key=val, key!=val, or key~regex; match booleans and null as true, false, null")
     p.add_argument("--paginate", action="store_true")
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(fn=cmd_api)
@@ -1081,6 +1287,7 @@ def main():
     sys.stdout, sys.stderr = SafeOut(sys.stdout), SafeOut(sys.stderr)
     try:
         a.fn(a)
+        sys.stdout.flush()  # inside the try, so a closed pipe here is handled too
     except ApiError as e:
         sys.exit(f"glab-lean: {e}")
     except BrokenPipeError:  # e.g. `| head`: exit quietly

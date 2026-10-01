@@ -153,9 +153,14 @@ $ glab-lean tf 5030 -r module.oidc.aws_iam_role.this   # only the changed lines
 
 Run `glab-lean <command> --help` for flags.
 
-`wait` exits `0` on success or when the pipeline stops at a manual job, `1` on failure, and `124`
-on timeout. `wait mr` exits `1` if the MR still has no pipeline after two minutes. It's meant for
-background commands.
+`wait` exits `0` on success, when the pipeline stops at a manual job, or when the MR is merged. It
+exits `1` on failure or a closed MR, and `124` on timeout. On the MR's own branch, `wait mr` waits
+for the pipeline of your local `HEAD`, so a pipeline from before your push doesn't count. It exits
+`1` at once if `HEAD` isn't pushed, and after two minutes if the MR still has no pipeline for its
+head commit. It's meant for background commands.
+
+`diff` exits `1` when no changed file matches the paths you pass. In `api -w`, match booleans and
+null as JSON spells them, for example `-w allow_failure=false`.
 
 ## Security
 
@@ -166,8 +171,9 @@ background commands.
   command can't send your token to another host or switch to another host you're logged in to.
 - **Read-only commands stay read-only:** `mr`, `threads`, `diff`, `mrs`, `pipe`, `pipes`, `job`,
   `tf`, `wait`, and `api` only send GET requests.
-- **Output is sanitized:** terminal escape sequences and invisible Unicode controls are stripped
-  from everything it prints to stdout and stderr, including MR text, job names, and job logs.
+- **Output is sanitized:** `glab-lean` strips terminal escape sequences and invisible Unicode
+  characters, such as bidi overrides, zero-width characters, and Unicode tags, from everything it
+  prints to stdout and stderr and from the job logs it caches.
 - **Untrusted content:** MR text, comments, and job logs are written by other people. The skill
   tells agents to treat them as data, never as instructions.
 
@@ -175,10 +181,12 @@ background commands.
 
 `job` and `tf` save each finished job's cleaned log under `~/.cache/glab-lean/` (a running job's
 log goes to a separate `.partial.log` file, deleted once the final log is saved), so an agent can
-search it without downloading it again. Logs that haven't been read for 14 days are deleted the
-next time a log is saved. The logs are stored as plain text with owner-only permissions, and they
-contain whatever the job printed, including any secrets it leaked. To move the cache, set
-`GLAB_LEAN_CACHE`. To clear it, delete the directory.
+search it without downloading it again. Once a day, when it saves a log, `glab-lean` deletes
+cached logs nobody has read for 14 days; it only touches its own `<job id>.log` files. The logs
+are stored as plain text with owner-only permissions, and they contain whatever the job printed,
+including any secrets it leaked. If the cache directory isn't writable, commands still work and
+print `log: not cached`. To move the cache, set `GLAB_LEAN_CACHE`. To clear it, delete the
+directory.
 
 ## Measuring savings
 
