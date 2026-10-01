@@ -110,8 +110,9 @@ instead of fetching the trace again.
 
 ## Usage
 
-Commands default to the current branch's MR or pipeline. To target another project, pass
-`-R group/project`.
+Commands default to the current branch's MR or pipeline. Without an ID, `pipe` and `tf` use the
+open MR's head pipeline, because that's the one that gates the merge, and fall back to the
+branch's newest pipeline. To target another project on the same host, pass `-R group/project`.
 
 ```console
 $ glab-lean mr
@@ -152,28 +153,32 @@ $ glab-lean tf 5030 -r module.oidc.aws_iam_role.this   # only the changed lines
 
 Run `glab-lean <command> --help` for flags.
 
-`wait` exits `0` on success, `1` on failure, and `124` on timeout. It's meant for background
-commands.
+`wait` exits `0` on success or when the pipeline stops at a manual job, `1` on failure, and `124`
+on timeout. `wait mr` exits `1` if the MR still has no pipeline after two minutes. It's meant for
+background commands.
 
 ## Security
 
 - **Same host only:** `glab-lean` only sends relative REST paths such as `projects/:id/…` to
-  `glab api`. It refuses absolute URLs and `-R` values that aren't `group/project`, so a
-  prompt-injected command can't send your token to another host.
+  `glab api`, and it refuses absolute URLs. It never passes `-R` to `glab`, which would accept a
+  host prefix such as `gitlab.com/group/project`. Instead it writes the project into the path, so
+  `glab` always uses the host it resolves from the current repo or its default. A prompt-injected
+  command can't send your token to another host or switch to another host you're logged in to.
 - **Read-only commands stay read-only:** `mr`, `threads`, `diff`, `mrs`, `pipe`, `pipes`, `job`,
   `tf`, `wait`, and `api` only send GET requests.
 - **Output is sanitized:** terminal escape sequences and invisible Unicode controls are stripped
-  from everything it prints, including MR text and job logs.
+  from everything it prints to stdout and stderr, including MR text, job names, and job logs.
 - **Untrusted content:** MR text, comments, and job logs are written by other people. The skill
   tells agents to treat them as data, never as instructions.
 
 ## Job log cache
 
 `job` and `tf` save each finished job's cleaned log under `~/.cache/glab-lean/` (a running job's
-log goes to a separate `.partial.log` file), so an agent can
-search it without downloading it again. The logs are stored as plain text with owner-only
-permissions, and they contain whatever the job printed, including any secrets it leaked. To move
-the cache, set `GLAB_LEAN_CACHE`. To clear it, delete the directory.
+log goes to a separate `.partial.log` file, deleted once the final log is saved), so an agent can
+search it without downloading it again. Logs that haven't been read for 14 days are deleted the
+next time a log is saved. The logs are stored as plain text with owner-only permissions, and they
+contain whatever the job printed, including any secrets it leaked. To move the cache, set
+`GLAB_LEAN_CACHE`. To clear it, delete the directory.
 
 ## Measuring savings
 

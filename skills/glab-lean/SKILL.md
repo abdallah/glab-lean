@@ -8,8 +8,9 @@ description: Token-lean GitLab CLI. Use for ANY GitLab read or CI task instead o
 # glab-lean
 
 `glab-lean` prints short, fixed-shape summaries of GitLab state. It wraps `glab api`, so auth and
-host come from `glab`. IDs default to the current branch's MR or pipeline. Pass `-R group/project`
-to target another repo.
+host come from `glab`. IDs default to the current branch's MR or pipeline; without an ID, `pipe`
+and `tf` use the open MR's head pipeline, then the branch's newest. Pass `-R group/project` to
+target another repo on the same host.
 
 ## Rules
 
@@ -35,7 +36,7 @@ to target another repo.
 | Task | Command |
 |---|---|
 | MR summary: readiness, blockers, approvals, pipeline, threads, files | `glab-lean mr [IID] [--desc N] [--files N]` |
-| Unresolved threads, with discussion IDs | `glab-lean threads [IID] [--all] [--full]` |
+| Unresolved threads, with discussion IDs | `glab-lean threads [IID] [--all] [--general] [--full]` |
 | Diffstat, or the diff for matching paths | `glab-lean diff [IID] [PATH…] [--max N]` |
 | List MRs | `glab-lean mrs [--mine] [--review USER] [--source B] [--search S] [--everywhere]` |
 | Pipeline: counts plus non-green jobs | `glab-lean pipe [ID] [--mr [IID]] [--ref B] [--all]` |
@@ -57,7 +58,7 @@ multi-line text.
 
 `glab-lean wait` exits `0` on success, `manual`, or `merged`, `1` on failure or cancel, `124` on
 timeout (default `--timeout 3600`, `--every 20`), and with an error message when the ID or project
-is wrong. With `--until`, it exits `0` when the state is reached and `1` if the job, pipeline, or MR
+is wrong. `wait mr` exits `1` if the MR still has no pipeline after two minutes. With `--until`, it exits `0` when the state is reached and `1` if the job, pipeline, or MR
 finishes without reaching it.
 
 `tf` finds plan jobs with `--name plan` (a regex on the job name). Use `--name 'tofu:plan'` or
