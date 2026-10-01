@@ -513,6 +513,30 @@ class SecondReview(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class JobCommand(unittest.TestCase):
+    JOB = {"id": 5, "name": "test", "stage": "test", "status": "failed", "pipeline": {"id": 1},
+           "ref": "main", "web_url": "https://h/g/p/-/jobs/5"}
+    LINES = ["$ make", "step one", "Error: first", "more"] + [f"line {i}" for i in range(30)]
+
+    def run_job(self, **kw):
+        args = dict(id=5, sections=False, section=None, full=False, grep=None, tail=None, head=None,
+                    max=30, context=0)
+        args.update(kw)
+        out = io.StringIO()
+        with mock.patch.object(gl, "job_meta", return_value=self.JOB), \
+                mock.patch.object(gl, "job_log", return_value=(self.LINES, "/tmp/5.log")), redirect_stdout(out):
+            gl.cmd_job(ns(**args))
+        return out.getvalue()
+
+    def test_grep_prints_numbered_matches_with_context(self):
+        out = self.run_job(grep="Error", context=1)
+        self.assertIn("2: step one\n3: Error: first\n4: more", out)
+
+    def test_default_shows_error_lines_of_failed_job(self):
+        out = self.run_job()
+        self.assertIn("-- error-like lines (1) --\n3: Error: first", out)
+
+
 class Excerpt(unittest.TestCase):
     def test_repeated_lines_collapse_and_runner_noise_is_skipped(self):
         lines = ["== get_sources", "Fetching changes with git depth set to 20...", "== step_script",

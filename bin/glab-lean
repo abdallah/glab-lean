@@ -349,6 +349,20 @@ def cmd_job(a):
     print("\n".join(l for l in lines[tail_from:end] if l))
 
 
+def show_hits(lines, hits, ctx, mx):
+    if len(hits) > mx:
+        print(f"({len(hits)} matches, showing last {mx}; raise --max or grep the log file)")
+        hits = hits[-mx:]
+    last = -2
+    for i in hits:
+        lo, hi = max(0, i - ctx), min(len(lines), i + ctx + 1)
+        if ctx and lo > last + 1:
+            print("--")
+        for k in range(max(lo, last + 1), hi):
+            print(f"{k + 1}: {cut(lines[k], 400)}")
+        last = hi - 1
+
+
 def body_end(lines):
     """Index where the runner's own cleanup sections start."""
     end = len(lines)
