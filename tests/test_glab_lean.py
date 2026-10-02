@@ -894,6 +894,14 @@ class Cli(unittest.TestCase):
         self.assertEqual(gl.REPO, "g/p")
         fn.assert_called_once()
 
+    def test_skill_frontmatter_values_are_valid_yaml(self):
+        # A plain YAML scalar can't contain ": ", so strict skill loaders reject such a value.
+        with open(os.path.join(HERE, "..", "skills", "glab-lean", "SKILL.md")) as f:
+            front = f.read().split("---")[1]
+        for line in front.strip().splitlines():
+            key, _, value = line.partition(": ")
+            self.assertFalse(": " in value and not value.startswith('"'), key)
+
     def test_help_runs(self):
         p = subprocess.run([sys.executable, PATH, "--help"], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0)

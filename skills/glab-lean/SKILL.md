@@ -2,7 +2,7 @@
 name: glab-lean
 license: MIT
 compatibility: Needs python3 3.8+ and the glab CLI logged in to a GitLab host.
-description: Token-lean GitLab CLI. Use for ANY GitLab read or CI task instead of `glab api`, `glab mr view`, `glab ci trace`, or a GitLab MCP server. Core commands: `glab-lean mr [IID]` (merge readiness), `glab-lean pipe [ID]` (failed jobs with their error lines), `glab-lean job ID` (log errors and tail), `glab-lean tf JOB` (Terraform/OpenTofu plan), `glab-lean wait job|pipe|mr ID` (blocks until done: always run it as a background command), plus threads, diff, mrs, and `api PATH -f fields`. When you invoke this skill, send your first glab-lean command in the same message so loading it costs no extra round trip.
+description: "Token-lean GitLab CLI. Use for ANY GitLab read or CI task instead of `glab api`, `glab mr view`, `glab ci trace`, or a GitLab MCP server. Core commands: `glab-lean mr [IID]` (merge readiness), `glab-lean pipe [ID]` (failed jobs with their error lines), `glab-lean job ID` (log errors and tail), `glab-lean tf JOB` (Terraform/OpenTofu plan), `glab-lean wait job|pipe|mr ID` (blocks until done: always run it as a background command), plus threads, diff, mrs, and `api PATH -f fields`. When you invoke this skill, send your first glab-lean command in the same message so loading it costs no extra round trip."
 ---
 
 # glab-lean
