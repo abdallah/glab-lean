@@ -182,7 +182,8 @@ null as JSON spells them, for example `-w allow_failure=false`.
 `job` and `tf` save each finished job's cleaned log under `~/.cache/glab-lean/` (a running job's
 log goes to a separate `.partial.log` file, deleted once the final log is saved), so an agent can
 search it without downloading it again. Once a day, when it saves a log, `glab-lean` deletes
-cached logs nobody has read for 14 days; it only touches its own `<job id>.log` files. The logs
+cached logs nobody has read for 14 days. It deletes only its own `<job id>.log` and temp files,
+and it records the time of the last cleanup in a `.glab-lean-pruned` file in the cache directory. The logs
 are stored as plain text with owner-only permissions, and they contain whatever the job printed,
 including any secrets it leaked. If the cache directory isn't writable, commands still work and
 print `log: not cached`. To move the cache, set `GLAB_LEAN_CACHE`. To clear it, delete the

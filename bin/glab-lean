@@ -128,18 +128,22 @@ def parallel(*fns, need=0):
     return out
 
 
-def branch():
-    p = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
-    if p.returncode != 0:
-        sys.exit("glab-lean: not in a git repo, so there's no current branch; pass an ID" +
-                 ("" if REPO else " (and -R group/project outside the repo)"))
-    return p.stdout.strip()
-
-
 def git(*args):
     """Output of a git command, or None outside a repo or on error."""
     p = subprocess.run(["git", *args], capture_output=True, text=True)
     return p.stdout.strip() if p.returncode == 0 else None
+
+
+def current_branch():
+    return git("rev-parse", "--abbrev-ref", "HEAD")
+
+
+def branch():
+    b = current_branch()
+    if b is None:
+        sys.exit("glab-lean: not in a git repo, so there's no current branch; pass an ID" +
+                 ("" if REPO else " (and -R group/project outside the repo)"))
+    return b
 
 
 def dur(s):
@@ -197,7 +201,8 @@ def resolve_mr(iid):
 def mr_pipeline(m):
     """(pipeline ID, project) for an MR's head pipeline. A fork MR's pipeline can live in the fork."""
     hp = m["head_pipeline"]
-    return hp["id"], str(hp.get("project_id") or ":id")
+    proj = hp.get("project_id")
+    return hp["id"], str(proj) if proj and proj != m.get("project_id") else ":id"
 
 
 def resolve_pipe(pid=None, mr=None, ref=None):
@@ -217,12 +222,14 @@ def resolve_pipe(pid=None, mr=None, ref=None):
     # The open MR's head pipeline is the one that gates the merge; the branch's newest pipeline
     # may be a branch pipeline that runs beside it, so it's only the fallback.
     b = branch()
-    mrs, ps = parallel(lambda: branch_mrs(b),
-                       lambda: glab(f"projects/:id/pipelines?{q(ref=b, per_page=1)}"), need=2)
+    branch_pipes = f"projects/:id/pipelines?{q(ref=b, per_page=1)}"
+    mrs, ps = parallel(lambda: branch_mrs(b), lambda: glab(branch_pipes), need=1)
     if mrs:
         m = glab(f"projects/:id/merge_requests/{mrs[0]['iid']}")
         if m.get("head_pipeline"):
             return mr_pipeline(m)
+    if ps is None:  # only needed now: ask again and let a second failure surface
+        ps = glab(branch_pipes)
     if ps:
         return ps[0]["id"], ":id"
     sys.exit(f"glab-lean: no pipelines for branch {b}")
@@ -327,8 +334,7 @@ def job_log(job):
 def save_log(path, lines, keep):
     # Logs can hold secrets a job printed: keep the cache private to the user.
     folder = os.path.dirname(path)
-    if not os.path.isdir(CACHE):
-        os.makedirs(CACHE, mode=0o700)
+    os.makedirs(CACHE, mode=0o700, exist_ok=True)  # never chmods an existing root
     os.makedirs(folder, mode=0o700, exist_ok=True)
     if os.stat(folder).st_uid == os.getuid():
         os.chmod(folder, 0o700)
@@ -405,13 +411,12 @@ def cmd_job(a):
         return
     lines, path = job_log(j)
     print(log_note(path, lines))
-    marks = sections(lines)
     if a.sections:
-        for name, lo, hi in marks:
+        for name, lo, hi in sections(lines):
             print(f"  {name}  lines {lo + 1}-{hi} ({hi - lo})")
         return
     if a.section:
-        for name, lo, hi in marks:
+        for name, lo, hi in sections(lines):
             if a.section in name:
                 print("\n".join(lines[lo + 1:hi]))
         return
@@ -455,27 +460,43 @@ def show_hits(lines, hits, ctx, mx):
 def sections(lines):
     """(name, marker index, end index) for each section. A runner section ends at the next runner
     section; a section the script opened ends at the next section of any kind."""
-    marks = [(i, MARK.match(l).group(1)) for i, l in enumerate(lines) if MARK.match(l)]
-    out = []
-    for n, (i, name) in enumerate(marks):
-        later = marks[n + 1:]
-        if RUNNER_SECTION.match(name):
-            later = [m for m in later if RUNNER_SECTION.match(m[1])]
-        out.append((name, i, later[0][0] if later else len(lines)))
-    return out
+    marks = []
+    for i, l in enumerate(lines):
+        m = MARK.match(l)
+        if m:
+            marks.append((i, m.group(1)))
+    out, next_any, next_runner = [], len(lines), len(lines)
+    for i, name in reversed(marks):
+        runner = bool(RUNNER_SECTION.match(name))
+        out.append((name, i, next_runner if runner else next_any))
+        next_any = i
+        if runner:
+            next_runner = i
+    return out[::-1]
 
 
-def body_end(lines):
-    """Index where the runner's trailing sections (artifacts, cache, cleanup) start. They're kept
-    when they hold a real error, such as an artifact upload that failed the job."""
-    end = len(lines)
-    for name, i, _ in reversed(sections(lines)):
+def trailer_start(marks, n):
+    """Index where the runner's trailing sections (artifacts, cache, cleanup) start."""
+    end = n
+    for name, i, _ in reversed(marks):
         if not TRAILER.match(name):
             break
         end = i
-    if any(l.startswith("ERROR: ") and not TRAILER_NOISE.search(l) for l in lines[end:]):
-        return len(lines)
     return end
+
+
+def real_errors(lines, start):
+    """ERROR lines from the runner's trailing sections that explain a failure, such as an artifact
+    upload that was too large, rather than routine messages."""
+    return [i for i in range(start, len(lines)) if lines[i].startswith("ERROR: ") and
+            not TRAILER_NOISE.search(lines[i])]
+
+
+def body_end(lines, marks=None):
+    """Where the job's own output ends: the start of the runner's trailing sections, unless they
+    hold a real error."""
+    end = trailer_start(sections(lines) if marks is None else marks, len(lines))
+    return len(lines) if real_errors(lines, end) else end
 
 
 def error_lines(lines, end, start=0):
@@ -497,8 +518,8 @@ def error_excerpt(job, n=10):
         lines, path = job_log(job)
     except (ApiError, OSError):
         return [], None
-    end = body_end(lines)
     marks = sections(lines)
+    end = body_end(lines, marks)
     script = next(((lo + 1, hi) for name, lo, hi in marks if name == "step_script"), None)
     start, stop = script or (0, end)  # the script's own output, without setup and after_script
     stop = min(stop, end)
@@ -514,10 +535,13 @@ def error_excerpt(job, n=10):
     shapes = {shape(lines[i]) for i in tail}
     found = [i for i in error_lines(lines, stop, start) if shape(lines[i]) not in shapes]
     errs = sorted(set(found[:1] + found[-4:]))  # the first error is often the cause
-    pick = sorted(errs + tail)
-    if len(pick) > n:
+    trailer = real_errors(lines, trailer_start(marks, len(lines)))[-2:]  # e.g. artifacts too large
+    pick = sorted(set(errs + tail))
+    if len(pick) + len(trailer) > n:
         first = errs[:1]
-        pick = first + [i for i in pick if i not in first][len(pick) - n:]
+        rest = [i for i in pick if i not in first]
+        pick = sorted(first + rest[len(rest) - max(0, n - len(first) - len(trailer)):])
+    pick += [i for i in trailer if i not in pick]
     out = []
     for i in pick:
         c = counts[shape(lines[i])] if i in tail else 1
@@ -546,6 +570,9 @@ def pipe_summary(pid, show_all=False, errors=True, proj=":id"):
     jobs, bridges = jobs or [], bridges or []
     print(f"pipeline {p['id']} {p['status']}  ref {p['ref']}  sha {p['sha'][:8]}  {dur(p.get('duration'))}"
           f"  source {p.get('source')}\n{p['web_url']}")
+    fork = re.match(r"https?://[^/]+/(.+?)/-/pipelines/", p["web_url"]) if proj != ":id" else None
+    if fork and (not REPO or fork.group(1) != REPO):
+        print(f"(this pipeline runs in {fork.group(1)}; pass -R {fork.group(1)} to job, wait, and retry)")
     counts = collections.Counter(j["status"] for j in jobs)
     print("jobs: " + (", ".join(f"{v} {k}" for k, v in counts.most_common()) or "none"))
     rows = jobs if show_all else [j for j in jobs if j["status"] in ORDER]
@@ -616,7 +643,22 @@ def cmd_wait(a):
         # On the MR's own branch, the local HEAD tells us which commit should be under test, so a
         # pipeline from before a push isn't taken as the answer.
         local = None if REPO else git("rev-parse", "HEAD")
-        here = None if REPO else git("rev-parse", "--abbrev-ref", "HEAD")
+        here = None if REPO else current_branch()
+        contains = {}  # MR head sha -> whether it includes the local HEAD
+
+        def includes_local(m):
+            """Ask GitLab whether the MR's head already includes the local HEAD, so a branch that
+            moved ahead (another push, a rebase) still counts. None when HEAD isn't on GitLab."""
+            if m["sha"] not in contains:
+                try:
+                    glab(f"projects/:id/repository/commits/{local}")
+                except ApiError as e:
+                    if "404" not in str(e):
+                        raise
+                    return None
+                base = glab(f"projects/:id/repository/merge_base?{q(**{'refs[]': [local, m['sha']]})}")
+                contains[m["sha"]] = (base or {}).get("id") == local
+            return contains[m["sha"]]
 
         def poll():
             m = glab(f"projects/:id/merge_requests/{iid}")
@@ -626,11 +668,13 @@ def cmd_wait(a):
             if m["state"] in ("merged", "closed"):
                 return m["state"], True, m["state"] == "merged", m
             late = time.time() >= started + NO_PIPE_GRACE  # GitLab had time to catch up
-            if local and m.get("source_branch") == here and m["sha"] != local:
-                upstream = git("rev-parse", "@{u}")
-                if upstream and upstream != local:
+            own = m.get("source_project_id", m.get("project_id")) == m.get("project_id")
+            if local and own and m.get("source_branch") == here and m["sha"] != local:
+                inc = includes_local(m)
+                if inc is None:
                     return "not-pushed", True, False, m
-                return "mr-not-updated", late, False, m  # pushed; GitLab hasn't refreshed the MR yet
+                if not inc:  # pushed, but GitLab hasn't moved the MR to it yet
+                    return "mr-not-updated", late, False, m
             hp = m.get("head_pipeline")
             if not hp:  # a pipeline can take a moment to appear after a push
                 return "no-pipeline", late, False, m
@@ -668,7 +712,7 @@ def cmd_wait(a):
     why = {"no-pipeline": f"no pipeline after {NO_PIPE_GRACE}s",
            "stale-pipeline": f"no pipeline for the head commit after {NO_PIPE_GRACE}s",
            "mr-not-updated": f"the MR still isn't on your pushed commit after {NO_PIPE_GRACE}s",
-           "not-pushed": "your local HEAD isn't pushed; push it first"}.get(st)
+           "not-pushed": "GitLab doesn't have your local HEAD; push it first"}.get(st)
     try:  # the exit code reports what was waited for, even if the summary can't be fetched
         if a.kind == "job":
             cmd_job(argparse.Namespace(id=int(a.id), **JOB_DEFAULTS))
@@ -804,13 +848,18 @@ def cmd_mr(a):
             print(f"  … {len(dl) - n} more lines (--desc -1)")
 
 
-def repo_path(p):
-    """A path as GitLab spells it: relative to the repo root, without a leading ./"""
+def path_candidates(p):
+    """How to read a path argument: relative to the current directory first (when it's inside the
+    repo and -R isn't set), then as written."""
+    raw = re.sub(r"^(\./)+", "", p)
+    if REPO:
+        return [raw]
     if os.path.isabs(p):
         top = git("rev-parse", "--show-toplevel")
-        if top:
-            p = os.path.relpath(p, top)
-    return re.sub(r"^(\./)+", "", p)
+        return [os.path.relpath(p, top)] if top else [raw]
+    prefix = git("rev-parse", "--show-prefix")
+    here = os.path.normpath(os.path.join(prefix, p)) if prefix else None
+    return [c for c in (here, raw) if c and not c.startswith("..")]
 
 
 def cmd_diff(a):
@@ -823,10 +872,16 @@ def cmd_diff(a):
         for d in diffs:
             print(stat_line(*diff_stat(d)))
         return
-    want = [repo_path(p) for p in a.paths]
+    def hits(c):
+        return [d for d in diffs if c in d["new_path"] or c in d["old_path"]]
+
+    want = []
+    for p in a.paths:  # the first reading that matches a changed file wins
+        cands = path_candidates(p)
+        want.append(next((c for c in cands if hits(c)), cands[0] if cands else p))
     shown = 0
     for d in diffs:
-        if not any(p in d["new_path"] or p in d["old_path"] for p in want):
+        if not any(c in d["new_path"] or c in d["old_path"] for c in want):
             continue
         shown += 1
         print(f"--- {d['old_path']}\n+++ {d['new_path']}")
@@ -960,7 +1015,7 @@ def cmd_tf(a):
         logs = list(ex.map(job_log, jobs))
     for j, (lines, path) in zip(jobs, logs):
         res, totals, errs = tf_parse(lines)
-        print(f"{job_header(j)}\nlog: {path or 'not cached (cache not writable)'}")
+        print(f"{job_header(j)}\n{log_note(path, lines)}")
         if a.resource:
             hits = [r for r in res if a.resource in r[2]]
             if not hits:

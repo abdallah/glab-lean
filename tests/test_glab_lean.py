@@ -593,11 +593,26 @@ class FullReview(unittest.TestCase):
         self.assertEqual(gl.body_end(upload), len(upload))
 
     # 3: wait mr after a push
-    def wait_mr(self, responses, local="new", upstream="new", grace=100):
+    def wait_mr(self, responses, local="new", pushed=True, base=None, grace=100):
+        """Run `wait mr` against MR responses served in order. GitLab knows the local HEAD when
+        `pushed`, and reports `base` (default: the local HEAD) as the merge base."""
+        mrs = iter(responses)
+
+        def fake(path, *x, **k):
+            if "/repository/commits/" in path:
+                if not pushed:
+                    raise gl.ApiError(f"GET {path}: 404 Commit Not Found")
+                return {"id": local}
+            if "/repository/merge_base" in path:
+                return {"id": base or local}
+            return next(mrs)
         with mock.patch.object(gl, "resolve_mr", return_value=7), mock.patch.object(gl, "NO_PIPE_GRACE", grace), \
-                mock.patch.object(gl, "git", side_effect=lambda *a: {("rev-parse", "HEAD"): local,
-                                                                     ("rev-parse", "@{u}"): upstream}.get(a, "f")):
-            return Regressions.wait(self, responses, kind="mr", id=None)
+                mock.patch.object(gl, "git", return_value=local), mock.patch.object(gl, "current_branch", return_value="f"), \
+                mock.patch.object(gl, "glab", side_effect=fake), mock.patch.object(gl, "pipe_summary"), \
+                mock.patch.object(gl.time, "sleep"), redirect_stdout(io.StringIO()), \
+                self.assertRaises(SystemExit) as e:
+            gl.cmd_wait(ns(kind="mr", id=None, until=None, every=0, timeout=60))
+        return e.exception.code
 
     def mr(self, sha, hp=None, state="opened"):
         return {"iid": 7, "state": state, "sha": sha, "source_branch": "f", "head_pipeline": hp}
@@ -605,11 +620,15 @@ class FullReview(unittest.TestCase):
     def test_wait_mr_ignores_pipeline_from_before_push(self):
         old = self.mr("old", {"id": 1, "status": "success", "sha": "old"})
         new = self.mr("new", {"id": 2, "status": "failed", "sha": "new"})
-        self.assertEqual(self.wait_mr([old, new]), 1)  # the old success isn't the answer
+        self.assertEqual(self.wait_mr([old, new], base="old"), 1)  # the old success isn't the answer
 
-    def test_wait_mr_unpushed_fails_fast(self):
+    def test_wait_mr_unpushed_fails_fast_even_without_upstream(self):
         old = self.mr("old", {"id": 1, "status": "success", "sha": "old"})
-        self.assertEqual(self.wait_mr([old], upstream="old"), 1)
+        self.assertEqual(self.wait_mr([old], pushed=False), 1)
+
+    def test_wait_mr_accepts_branch_ahead_of_local(self):
+        ahead = self.mr("bot", {"id": 3, "status": "success", "sha": "bot"})  # a bot pushed on top
+        self.assertEqual(self.wait_mr([ahead]), 0)
 
     def test_wait_mr_stale_pipeline_gives_up_and_merged_stops(self):
         stale = self.mr("new", {"id": 1, "status": "success", "sha": "old", "ref": "f"})
@@ -630,7 +649,8 @@ class FullReview(unittest.TestCase):
         with mock.patch.object(gl, "branch", return_value="main"), \
                 mock.patch.object(gl, "glab", side_effect=by_path(routes)):
             self.assertEqual(gl.resolve_pipe(), (100, ":id"))
-        self.assertEqual(gl.mr_pipeline({"head_pipeline": {"id": 500, "project_id": 99}}), (500, "99"))
+        self.assertEqual(gl.mr_pipeline({"project_id": 1, "head_pipeline": {"id": 500, "project_id": 99}}), (500, "99"))
+        self.assertEqual(gl.mr_pipeline({"project_id": 1, "head_pipeline": {"id": 500, "project_id": 1}}), (500, ":id"))
         with mock.patch.object(gl, "CACHE", self.tmpdir()), mock.patch.object(gl, "glab", return_value="x") as g:
             gl.job_log(self.job(3, pipeline={"id": 500, "project_id": 99}))
         self.assertEqual(g.call_args[0][0], "projects/99/jobs/3/trace")
@@ -792,6 +812,59 @@ class FullReview(unittest.TestCase):
         p.wait()
         self.assertEqual(p.returncode, 0)
         self.assertNotIn(b"BrokenPipeError", err)
+
+
+class FixReview(unittest.TestCase):
+    """One test per finding in the review of the full-review fixes."""
+
+    job = FullReview.job
+
+    def test_excerpt_shows_trailer_errors_in_log_order(self):
+        lines = ["== step_script", "build ok", "tests ok", "== upload_artifacts_on_failure",
+                 "ERROR: Uploading artifacts as \"archive\" to coordinator... 413 Request Entity Too Large",
+                 "== cleanup_file_variables", "ERROR: Job failed: exit code 1"]
+        with mock.patch.object(gl, "job_log", return_value=(lines, "/tmp/x.log")):
+            out, _ = gl.error_excerpt(self.job(1))
+        self.assertTrue(out[-1].endswith("413 Request Entity Too Large"))
+        self.assertNotIn("ERROR: Job failed: exit code 1", out)
+        lines = ["== step_script", "Error: first"] + [f"step {i} done" for i in range(20)] + ["Error: last"]
+        with mock.patch.object(gl, "job_log", return_value=(lines, "/tmp/x.log")):
+            out, _ = gl.error_excerpt(self.job(1), n=4)
+        self.assertEqual(out, sorted(out, key=lines.index))
+
+    def test_cache_root_created_by_another_thread(self):
+        d = os.path.join(Regressions.tmpdir(self), "new")
+        real = os.makedirs
+
+        def racing(name, *a, **k):  # another thread creates the directory first
+            if name == d and not os.path.isdir(d):
+                real(d)
+            return real(name, *a, **k)
+        with mock.patch.object(gl, "CACHE", d), mock.patch.object(gl, "glab", return_value="log"), \
+                mock.patch.object(gl.os, "makedirs", racing):
+            _, path = gl.job_log(self.job(1, status="success"))
+        self.assertIsNotNone(path)
+
+    def test_failed_branch_pipelines_lookup_falls_back_to_mr(self):
+        routes = {"merge_requests?": [{"iid": 7}], "merge_requests/7": {"head_pipeline": {"id": 2}},
+                  "pipelines?": gl.ApiError("GET pipelines: 403 Forbidden")}
+        with mock.patch.object(gl, "branch", return_value="f"), \
+                mock.patch.object(gl, "glab", side_effect=by_path(routes)):
+            self.assertEqual(gl.resolve_pipe(), (2, ":id"))
+
+    def test_fork_pipeline_names_its_project(self):
+        pipe = dict(FullReview.PIPE, web_url="https://h/forker/proj/-/pipelines/1")
+        routes = {"/jobs": [], "/bridges": [], "pipelines/1": pipe}
+        out = io.StringIO()
+        with mock.patch.object(gl, "glab", side_effect=by_path(routes)), redirect_stdout(out):
+            gl.pipe_summary(1, proj="99")
+        self.assertIn("pass -R forker/proj", out.getvalue())
+
+    def test_paths_resolve_from_the_current_directory_first(self):
+        git = {("rev-parse", "--show-prefix"): "src/app/"}
+        with mock.patch.object(gl, "git", side_effect=lambda *a: git.get(a)), mock.patch.object(gl, "REPO", None):
+            self.assertEqual(gl.path_candidates("./main.py"), ["src/app/main.py", "main.py"])
+            self.assertEqual(gl.path_candidates("../lib/util.py"), ["src/lib/util.py"])
 
 
 def argparse_error():
