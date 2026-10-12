@@ -103,9 +103,10 @@ or `GEMINI.md`:
 
 Use the `glab-lean` CLI for GitLab reads and CI before `glab api` or a GitLab MCP server:
 `glab-lean mr`, `threads`, `diff`, `pipe`, `job ID`, `tf JOB`, and `api PATH -f fields`.
-Run `glab-lean --help` for the full list. Wait on CI with `glab-lean wait job|pipe|mr ID` as a
-background command instead of sleep loops. For job logs, search the cached log file it prints
-instead of fetching the trace again.
+Run `glab-lean --help` for the full list. Wait on CI with `glab-lean wait job ID|pipe|mr` as a
+background command instead of sleep loops; after a push, `wait pipe` with no ID waits for your
+`HEAD`. For more of a job log, use `glab-lean job ID --grep RE` or `tf JOB -r ADDR`, not the
+cached file or the trace.
 ```
 
 ## Usage
@@ -145,7 +146,7 @@ $ glab-lean tf 5030 -r module.oidc.aws_iam_role.this   # only the changed lines
 | `mr`, `threads`, `diff`, `mrs` | MR readiness, unresolved threads, diffstat or file diffs, MR lists |
 | `pipe`, `pipes` | Pipeline summary with only non-green jobs, plus the main error lines of up to three failed jobs (`--brief` skips them); recent pipelines |
 | `job` | Job status, error lines, and tail; `--grep`, `--tail`, `--section` |
-| `tf` | Terraform/OpenTofu plan summary, drift, totals, and errors; `-r` for one resource |
+| `tf` | Terraform/OpenTofu plan summary, drift, totals, and errors; `-r` (repeatable) for chosen resources |
 | `wait` | Wait silently for a job, pipeline, or MR to finish, then print the summary |
 | `run`, `play`, `retry`, `cancel`, `merge` | Pipeline and MR actions, one line each |
 | `note`, `reply`, `resolve` | MR comments and threads |
@@ -157,7 +158,9 @@ Run `glab-lean <command> --help` for flags.
 exits `1` on failure or a closed MR, and `124` on timeout. On the MR's own branch, `wait mr` waits
 for the pipeline of your local `HEAD`, so a pipeline from before your push doesn't count. It exits
 `1` at once if `HEAD` isn't pushed, and after two minutes if the MR still has no pipeline for its
-head commit. It's meant for background commands.
+head commit. `wait pipe` with no ID waits like `wait mr` when the branch has an open MR. Otherwise it waits for
+the newest pipeline on this branch for your local `HEAD`, exits `1` at once if `HEAD` isn't
+pushed, and exits `1` if no pipeline appears within two minutes. It's meant for background commands.
 
 `diff` exits `1` when no changed file matches the paths you pass. In `api -w`, match booleans and
 null as JSON spells them, for example `-w allow_failure=false`.
@@ -181,7 +184,9 @@ null as JSON spells them, for example `-w allow_failure=false`.
 
 `job` and `tf` save each finished job's cleaned log under `~/.cache/glab-lean/` (a running job's
 log goes to a separate `.partial.log` file, deleted once the final log is saved), so an agent can
-search it without downloading it again. Once a day, when it saves a log, `glab-lean` deletes
+search it with `job --grep` or `tf -r` without downloading it again. Output doesn't print the
+cache path: agents that saw it read whole logs with `sed` or `cat` instead of `--grep`, which
+prints at most `--max` matches. Once a day, when it saves a log, `glab-lean` deletes
 cached logs nobody has read for 14 days. It deletes only its own `<job id>.log` and temp files,
 and it records the time of the last cleanup in a `.glab-lean-pruned` file in the cache directory. The logs
 are stored as plain text with owner-only permissions, and they contain whatever the job printed,

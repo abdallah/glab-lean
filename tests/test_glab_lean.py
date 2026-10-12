@@ -437,6 +437,68 @@ class SecondReview(unittest.TestCase):
         with mock.patch.object(gl, "resolve_mr", return_value=7):
             self.assertEqual(self.wait([mr, late], kind="mr", id=None), 0)
 
+    def wait_head(self, responses, mrs=(), branch="feat"):
+        """`wait pipe` with no ID; returns (exit code, requested paths)."""
+        paths, it = [], iter(responses)
+
+        def fake(path, *x, **k):
+            paths.append(path)
+            r = next(it)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        with mock.patch.object(gl, "glab", side_effect=fake), mock.patch.object(gl, "REPO", None), \
+                mock.patch.object(gl, "git", return_value="abc123"), \
+                mock.patch.object(gl, "current_branch", return_value=branch), \
+                mock.patch.object(gl, "branch_mrs", return_value=list(mrs)), \
+                mock.patch.object(gl, "pipe_summary"), mock.patch.object(gl.time, "sleep"), \
+                redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
+            gl.cmd_wait(ns(kind="pipe", id=None, until=None, every=0, timeout=60))
+        return e.exception.code, paths
+
+    def test_wait_pipe_without_id_follows_local_head(self):
+        code, paths = self.wait_head([[], {"id": "abc123"}, [{"id": 9}], {"status": "running"}, {"status": "success"}])
+        self.assertEqual(code, 0)
+        self.assertIn("sha=abc123", paths[0])
+        self.assertIn("ref=feat", paths[0])  # an older pipeline for this commit on another ref doesn't count
+        self.assertEqual(paths[-1], "projects/:id/pipelines/9")
+        self.assertNotIn("ref=", self.wait_head([[{"id": 9}], {"status": "success"}], branch="HEAD")[1][0])
+
+    def test_wait_pipe_without_id_gives_up(self):
+        with mock.patch.object(gl, "NO_PIPE_GRACE", 0):
+            self.assertEqual(self.wait_head([[], {"id": "abc123"}])[0], 1)
+        not_pushed = gl.ApiError("GET projects/:id/repository/commits/abc123: 404 Not Found")
+        self.assertEqual(self.wait_head([[], not_pushed])[0], 1)  # at once, not after the grace period
+
+    def test_wait_pipe_without_id_defers_to_the_mr(self):
+        with mock.patch.object(gl, "resolve_mr", return_value=7):
+            code, paths = self.wait_head([{"iid": 7, "state": "merged"}], mrs=[{"iid": 7}])
+        self.assertEqual((code, paths), (0, ["projects/:id/merge_requests/7"]))
+
+    def test_wait_without_id(self):
+        for kind, id_ in (("job", None), ("pipe", "")):
+            with mock.patch.object(gl, "git", return_value=None), self.assertRaises(SystemExit) as e:
+                gl.cmd_wait(ns(kind=kind, id=id_, until=None, every=0, timeout=60))
+            self.assertIn("needs an ID", str(e.exception.code))
+
+    def tf(self, *argv):
+        job = {"id": 5, "name": "plan", "stage": "plan", "status": "success", "duration": 1,
+               "pipeline": {"id": 1}, "ref": "main"}
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["glab-lean", "tf", "5", *argv]), mock.patch.object(gl, "REPO", None), \
+                mock.patch.object(gl, "job_meta", return_value=job), \
+                mock.patch.object(gl, "job_log", return_value=(PLAN.split("\n"), "/c/x/5.log")), redirect_stdout(out):
+            gl.main()
+        return out.getvalue()
+
+    def test_tf_several_resources(self):
+        out = self.tf("-r", "aws_iam_role.this", "-r", "aws_sqs_queue.old", "-r", "aws_iam_role")
+        self.assertEqual(out.count('resource "aws_iam_role" "this"'), 1)  # matched twice, printed once
+        self.assertIn('resource "aws_sqs_queue" "old"', out)
+        self.assertNotIn('resource "aws_instance"', out)
+        self.assertNotIn("/c/x/5.log", out)
+        self.assertIn("Plan:", self.tf("-r", ""))  # an empty value is no filter
+
     def test_wait_manual_and_blocked_agree(self):
         self.assertEqual(self.wait([{"status": "manual"}], kind="pipe"), 0)
         self.assertEqual(self.wait([{"status": "blocked"}], kind="pipe"), 0)
@@ -775,7 +837,7 @@ class FullReview(unittest.TestCase):
         lines = [f"l{i}" for i in range(5)]
         out = self.capture(gl.show_hits, lines, [2], 1, 30)
         self.assertEqual(out, "2: l1\n3: l2\n4: l3\n")  # no leading separator
-        self.assertEqual(self.capture(gl.show_hits, lines, [1, 2], 0, 0), "(2 matches, showing last 0; raise --max or grep the log file)\n")
+        self.assertEqual(self.capture(gl.show_hits, lines, [1, 2], 0, 0), "(2 matches, showing last 0; raise --max or narrow --grep)\n")
         with self.assertRaises(SystemExit):
             gl.regex("(")
         with self.assertRaises(argparse_error()):

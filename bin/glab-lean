@@ -394,10 +394,13 @@ def job_header(j):
             f"  pipeline {j['pipeline']['id']}  ref {j['ref']}{reason}")
 
 
-def log_note(path, lines):
+def log_note(path, lines, more):
+    # No path: agents that see it sed/cat the whole file instead of using the capped options.
     if path is None:
         return f"log: not cached (can't write {tilde(CACHE)}); {len(lines)} lines"
-    return f"log: {path} ({len(lines)} lines; grep it directly for more)"
+    if path.endswith(".partial.log"):
+        return f"log: {len(lines)} lines so far (not final); more with {more}"
+    return f"log: {len(lines)} lines cached; more with {more}"
 
 
 NO_LOG = ("created", "pending", "manual", "skipped", "scheduled", "waiting_for_resource", "preparing",
@@ -410,7 +413,7 @@ def cmd_job(a):
     if j["status"] in NO_LOG:
         return
     lines, path = job_log(j)
-    print(log_note(path, lines))
+    print(log_note(path, lines, f"glab-lean job {j['id']} --grep RE [-C N]"))
     if a.sections:
         for name, lo, hi in sections(lines):
             print(f"  {name}  lines {lo + 1}-{hi} ({hi - lo})")
@@ -445,7 +448,7 @@ def cmd_job(a):
 
 def show_hits(lines, hits, ctx, mx):
     if len(hits) > mx:
-        print(f"({len(hits)} matches, showing last {mx}; raise --max or grep the log file)")
+        print(f"({len(hits)} matches, showing last {mx}; raise --max or narrow --grep)")
         hits = hits[len(hits) - mx:]
     last = -1
     for i in hits:
@@ -591,11 +594,8 @@ def pipe_summary(pid, show_all=False, errors=True, proj=":id"):
             excerpts = dict(zip((j["id"] for j in failed), ex.map(error_excerpt, failed)))
 
     def show_excerpt(j, indent):
-        lines, path = excerpts.get(j["id"], ([], None))
-        for l in lines:
+        for l in excerpts.get(j["id"], ([], None))[0]:
             print(f"{indent}| {l}")
-        if path:
-            print(f"{indent}log: {path}")
 
     for (status, stage, base, allowed), js in groups.items():
         extra = " (allowed)" if allowed else ""
@@ -637,7 +637,16 @@ JOB_DEFAULTS = dict(sections=False, section=None, full=False, grep=None, tail=No
 
 def cmd_wait(a):
     until = set(a.until.split(",")) if a.until else set()
-    started = time.time()
+    started, sha = time.time(), None
+    a.id = a.id or None  # `wait pipe "$EMPTY"` means no ID, not int("")
+    if a.id is None and a.kind == "job":
+        sys.exit("glab-lean: wait job needs an ID")
+    if a.id is None and a.kind == "pipe":
+        sha, here = git("rev-parse", "HEAD"), current_branch()
+        if not sha:
+            sys.exit("glab-lean: wait pipe needs an ID outside a git repo")
+        if here != "HEAD" and branch_mrs(here):  # the MR's pipeline is the one that gates the merge
+            a.kind = "mr"
     if a.kind == "mr":
         iid = resolve_mr(a.id)
         # On the MR's own branch, the local HEAD tells us which commit should be under test, so a
@@ -683,11 +692,24 @@ def cmd_wait(a):
             st = hp["status"]
             return st, st in DONE_PIPE, st in OK_STATES, m
     else:
-        url = f"projects/:id/{'jobs' if a.kind == 'job' else 'pipelines'}/{int(a.id)}"
         final = DONE_JOB if a.kind == "job" else DONE_PIPE
+        # The ref filter keeps an older pipeline for the same commit on another branch or tag out.
+        if sha:
+            head_pipes = f"projects/:id/pipelines?{q(sha=sha, ref=None if here == 'HEAD' else here, per_page=1)}"
 
         def poll():
-            o = glab(url)
+            if a.id is None:  # lock onto the newest pipeline for the local HEAD once it appears
+                ps = glab(head_pipes)
+                if not ps:
+                    try:
+                        glab(f"projects/:id/repository/commits/{sha}")
+                    except ApiError as e:
+                        if "404" not in str(e):
+                            raise
+                        return "not-pushed", True, False, None
+                    return "no-head-pipeline", time.time() >= started + NO_PIPE_GRACE, False, None
+                a.id = ps[0]["id"]
+            o = glab(f"projects/:id/{'jobs' if a.kind == 'job' else 'pipelines'}/{int(a.id)}")
             st = o["status"]
             hit = st in until if until else st in OK_STATES
             return st, st in until or st in final, hit, o
@@ -712,10 +734,13 @@ def cmd_wait(a):
     why = {"no-pipeline": f"no pipeline after {NO_PIPE_GRACE}s",
            "stale-pipeline": f"no pipeline for the head commit after {NO_PIPE_GRACE}s",
            "mr-not-updated": f"the MR still isn't on your pushed commit after {NO_PIPE_GRACE}s",
-           "not-pushed": "GitLab doesn't have your local HEAD; push it first"}.get(st)
+           "not-pushed": "GitLab doesn't have your local HEAD; push it first",
+           "no-head-pipeline": f"no pipeline for HEAD {(sha or '')[:8]} after {NO_PIPE_GRACE}s"}.get(st)
     try:  # the exit code reports what was waited for, even if the summary can't be fetched
         if a.kind == "job":
             cmd_job(argparse.Namespace(id=int(a.id), **JOB_DEFAULTS))
+        elif a.kind == "pipe" and a.id is None:
+            print(why)
         elif a.kind == "pipe":
             pipe_summary(int(a.id))
         elif until or why or not (obj.get("head_pipeline") or {}).get("id"):
@@ -1001,6 +1026,9 @@ def tf_jobs(a):
         return [job_meta(a.job)]
     pid, proj = resolve_pipe(a.pipe, a.mr)
     jobs = glab(f"projects/{proj}/pipelines/{pid}/jobs?per_page=100", paginate=True)
+    fork = re.match(r"https?://[^/]+/(.+?)/-/jobs/", jobs[0]["web_url"]) if proj != ":id" and jobs else None
+    if fork:
+        print(f"(these jobs run in {fork.group(1)}; pass -R {fork.group(1)} to tf and job)")
     rx = regex(a.name, re.I)
     sel = [j for j in jobs if rx.search(j["name"]) and j["status"] in ("success", "failed", "canceled")]
     if not sel:
@@ -1015,12 +1043,14 @@ def cmd_tf(a):
         logs = list(ex.map(job_log, jobs))
     for j, (lines, path) in zip(jobs, logs):
         res, totals, errs = tf_parse(lines)
-        print(f"{job_header(j)}\n{log_note(path, lines)}")
-        if a.resource:
-            hits = [r for r in res if a.resource in r[2]]
-            if not hits:
-                print(f"  no resource matching {a.resource!r}")
-            for i, _, _ in hits:
+        more = f"glab-lean tf {j['id']} -r ADDR [-r ADDR...] or glab-lean job {j['id']} --grep RE"
+        print(f"{job_header(j)}\n{log_note(path, lines, more)}")
+        wants = [w for w in a.resource or [] if w]  # an empty -r "$X" means no filter, not "match all"
+        if wants:
+            for w in wants:
+                if not any(w in r[2] for r in res):
+                    print(f"  no resource matching {w!r}")
+            for i, _, _ in [r for r in res if any(w in r[2] for w in wants)]:
                 print("\n".join(tf_block(lines, i, a.full)))
             continue
         drift = [r for r in res if r[1].startswith("drift")]
@@ -1263,7 +1293,7 @@ def main():
 
     p = sp.add_parser("wait", help="block silently until a job/pipeline/MR settles, then summarize")
     p.add_argument("kind", choices=["job", "pipe", "mr"])
-    p.add_argument("id", nargs="?", type=mr_iid, help="job, pipeline, or MR ID (MR defaults to the branch's)")
+    p.add_argument("id", nargs="?", type=mr_iid, help="job, pipeline, or MR ID (pipe: the local HEAD's pipeline; MR: the branch's)")
     p.add_argument("--until", help="comma-separated states to stop on (MR: merged, mergeable, …)")
     p.add_argument("--every", type=int, default=20, help="poll interval seconds")
     p.add_argument("--timeout", type=int, default=3600)
@@ -1274,7 +1304,7 @@ def main():
     p.add_argument("--pipe", type=int)
     p.add_argument("--mr", nargs="?", const="", type=mr_iid)
     p.add_argument("--name", default="plan", help="job-name regex for finished jobs, with --pipe/--mr")
-    p.add_argument("-r", "--resource", help="show the change block for resources containing this")
+    p.add_argument("-r", "--resource", action="append", help="show the change block for resources containing this (repeatable)")
     p.add_argument("--full", action="store_true", help="with -r: include unchanged lines")
     p.add_argument("--max", type=int, default=60)
     p.set_defaults(fn=cmd_tf)
@@ -1337,8 +1367,6 @@ def main():
     REPO = a.repo
     if REPO and not REPO_RX.match(REPO):
         sys.exit("glab-lean: -R takes group/project, not a URL")
-    if a.cmd == "wait" and a.kind != "mr" and a.id is None:
-        sys.exit(f"glab-lean: wait {a.kind} needs an ID")
     sys.stdout, sys.stderr = SafeOut(sys.stdout), SafeOut(sys.stderr)
     try:
         a.fn(a)
