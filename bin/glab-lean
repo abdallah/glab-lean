@@ -735,7 +735,8 @@ def cmd_wait(a):
            "stale-pipeline": f"no pipeline for the head commit after {NO_PIPE_GRACE}s",
            "mr-not-updated": f"the MR still isn't on your pushed commit after {NO_PIPE_GRACE}s",
            "not-pushed": "GitLab doesn't have your local HEAD; push it first",
-           "no-head-pipeline": f"no pipeline for HEAD {(sha or '')[:8]} after {NO_PIPE_GRACE}s"}.get(st)
+           "no-head-pipeline": f"HEAD {(sha or '')[:8]} is pushed, but no pipeline appeared in {NO_PIPE_GRACE}s; "
+                               "the CI rules may skip branch pipelines"}.get(st)
     try:  # the exit code reports what was waited for, even if the summary can't be fetched
         if a.kind == "job":
             cmd_job(argparse.Namespace(id=int(a.id), **JOB_DEFAULTS))
@@ -1043,7 +1044,7 @@ def cmd_tf(a):
         logs = list(ex.map(job_log, jobs))
     for j, (lines, path) in zip(jobs, logs):
         res, totals, errs = tf_parse(lines)
-        more = f"glab-lean tf {j['id']} -r ADDR [-r ADDR...] or glab-lean job {j['id']} --grep RE"
+        more = (f"glab-lean tf {j['id']} -r ADDR [-r ADDR...] or " if res else "") + f"glab-lean job {j['id']} --grep RE"
         print(f"{job_header(j)}\n{log_note(path, lines, more)}")
         wants = [w for w in a.resource or [] if w]  # an empty -r "$X" means no filter, not "match all"
         if wants:
